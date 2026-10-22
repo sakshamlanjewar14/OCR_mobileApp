@@ -302,7 +302,14 @@ def _split_card_image(image: Image.Image, depth: int = 0) -> list[Image.Image] |
 
 
 def _clean_lines(text: str) -> list[str]:
-    source_lines = [re.sub(r"\s+", " ", line.replace("\ufffd", "").replace("•", "")).strip(" ,;|\t") for line in text.splitlines() if line.strip()]
+    source_lines: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        normalized = re.sub(r"\s+", " ", line.replace("\ufffd", "").replace("•", "")).strip(" ,;|\t")
+        fragments = re.split(r"(?=\b(?:Mob(?:ile)?|Tel(?:ephone)?|Fax|Email|Website|Web|Office\s+No\.?|Address)\s*[:#\-])", normalized, flags=re.I)
+        for fragment in fragments:
+            source_lines.extend(part.strip(" ,;|\t") for part in fragment.split("|") if part.strip(" ,;|\t"))
     label_names = (
         r"company(?:\s+(?:full\s+)?name)?|business(?:\s+name)?|firm(?:\s+name)?|organization(?:\s+name)?|"
         r"owner(?:\s+name)?|contact\s+(?:person|name)|person\s+name|name|designation|job\s+title|"
@@ -498,10 +505,12 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         ),
         None,
     )
+    if designation:
+        designation = re.split(r"\s+(?:[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:https?://|www\.)\S+|\+?\d[\d ()-]{7,})", designation, maxsplit=1, flags=re.I)[0].strip(" ,;:-")
     # When a card has no explicit company label or legal suffix, a branded
     # website is safer evidence than treating a person's prominent name as a
     # company. Use the registered domain as a review candidate.
-    if company and not company_markers.search(company) and website:
+    if company and not company_markers.search(company) and website and (len(company.split()) == 1 or company.isupper()):
         host = re.sub(r"^https?://|^www\.", "", website, flags=re.I).split(".")[0]
         if host and host.casefold() not in {"gmail", "yahoo", "google", "facebook", "instagram"}:
             company = re.sub(r"[-_]+", " ", host).title()
@@ -535,12 +544,14 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     excluded_address_lines = {value.strip().casefold() for value in (company, owner, designation) if value}
     address_indexes = explicit_address_indexes or [
         index for index, line in enumerate(lines)
-        if line.strip().casefold() not in excluded_address_lines and address_marker.search(line)
+        if line.strip().casefold() not in excluded_address_lines
+        and not re.match(r"^\s*(?:mob(?:ile)?|tel(?:ephone)?|fax|email)\b", line, re.I)
+        and address_marker.search(line)
     ]
     address_parts: list[str] = []
     if address_indexes:
         start = address_indexes[0]
-        boundary = re.compile(r"@|https?://|www\.|\b(tel\.?|telephone|mobile|phone|email|e-mail|web|website|fax|director|manager|ceo|owner|founder|mto|iso)\b", re.I)
+        boundary = re.compile(r"@|https?://|www\.|\b(mob|tel\.?|telephone|mobile|phone|email|e-mail|web|website|fax|director|manager|ceo|owner|founder|mto|iso)\b", re.I)
         for index in range(start, len(lines)):
             line = address_label.sub("", lines[index], count=1).strip(" ,;:-") if index == start else lines[index]
             if not line or line.strip().casefold() in excluded_address_lines or boundary.search(line):

@@ -57,7 +57,9 @@ def _translate_parts(parts: list[str], language: str = "hi") -> list[str]:
 
 
 def translate_document_text(text: str) -> tuple[str | None, str]:
-    if not indic_language(text):
+    # A single misread glyph in an otherwise English card is OCR noise, not a
+    # multilingual document. Translating it can corrupt already-correct names.
+    if len(DEVANAGARI.findall(text)) < 3 or not indic_language(text):
         return text, "not_needed"
     normalized = "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c for c in text)
     pieces: list[str] = []

@@ -131,6 +131,26 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertEqual(fields["whatsapp_link"], "https://wa.me/919876543210")
         self.assertEqual(fields["pincode"], "411001")
 
+    def test_company_line_wins_over_authorised_product_brand_and_pipe_layout(self) -> None:
+        fields = _parse_fields(
+            "GAWADE\nGREEN POWER\nDeepak Shivaji Gawade\nManaging Director\n"
+            "www.gawadegreenpower.com\nAuthorised OEM for\n"
+            "Escorts-Kubota Genset Escorts Kubota Limited\n"
+            "Deepak Shivaji Gawade | Gawade Green Power Pvt. Ltd.\n"
+            "Managing Director gawadegreenpower@gmail.com\n"
+            "Office No. 210, 2nd Floor, Laxmi Complex, Near Smart Bajar, Pune"
+        )
+        self.assertEqual(fields["company_name"], "Gawade Green Power Pvt. Ltd.")
+        self.assertEqual(fields["owner_name"], "Deepak Shivaji Gawade")
+        self.assertEqual(fields["designation"], "Managing Director")
+
+    def test_company_uses_brand_domain_when_person_name_is_prominent(self) -> None:
+        fields = _parse_fields(
+            "KAPIL KADAM\nFounder & CEO\nwww.barbows.com\nPune, India"
+        )
+        self.assertEqual(fields["company_name"], "Barbows")
+        self.assertEqual(fields["owner_name"], "KAPIL KADAM")
+
 
 if __name__ == "__main__":
     unittest.main()
