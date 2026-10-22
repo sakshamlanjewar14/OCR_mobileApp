@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Lead Gennie",
+    "slug": "lead-gennie",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "android": { "package": "com.leadgennie.mobile", "permissions": ["CAMERA"] },
+    "ios": { "bundleIdentifier": "com.leadgennie.mobile", "supportsTablet": true, "infoPlist": { "NSCameraUsageDescription": "Scan business cards to prepare lead details for your review." } },
+    "plugins": ["expo-camera", ["expo-image-picker", { "photosPermission": "Select business-card images for lead review." }]]
+  }
+}

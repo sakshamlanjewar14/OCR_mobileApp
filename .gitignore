@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.venv/
+__pycache__/
+*.py[cod]
+uploads/
+backend/.env
+backend/.venv/
+backend/ocr-runtime/
+frontend/.env.local
+frontend/node_modules/
+frontend/dist/

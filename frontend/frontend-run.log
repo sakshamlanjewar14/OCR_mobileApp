@@ -1,0 +1,24 @@
+
+  VITE v6.4.4  ready in 740 ms
+
+  ➜  Local:   http://127.0.0.1:5173/
+  ➜  press h + enter to show help
+6:08:41 pm [vite] (client) hmr update /src/App.tsx
+6:08:41 pm [vite] (client) hmr update /src/App.tsx
+6:08:52 pm [vite] (client) hmr update /src/App.tsx
+6:09:25 pm [vite] (client) hmr update /src/App.tsx
+6:09:36 pm [vite] (client) hmr update /src/App.tsx
+6:09:48 pm [vite] (client) hmr update /src/App.tsx
+6:09:55 pm [vite] (client) hmr update /src/styles.css
+6:17:07 pm [vite] (client) hmr update /src/App.tsx
+6:17:09 pm [vite] (client) hmr update /src/styles.css
+6:24:52 pm [vite] (client) page reload index.html
+6:24:53 pm [vite] (client) hmr update /src/App.tsx
+6:32:52 pm [vite] (client) hmr update /src/App.tsx
+7:25:09 pm [vite] (client) hmr update /src/App.tsx
+7:25:17 pm [vite] (client) hmr update /src/App.tsx
+7:29:10 pm [vite] (client) hmr update /src/App.tsx
+7:32:41 pm [vite] (client) hmr update /src/App.tsx
+11:27:08 pm [vite] .env.local changed, restarting server...
+11:27:08 pm [vite] .env.local changed, restarting server...
+11:27:09 pm [vite] server restarted.
