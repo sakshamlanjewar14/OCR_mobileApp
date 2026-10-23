@@ -523,6 +523,40 @@ def _format_labeled_text(text: str) -> str:
     return "\n".join(formatted)
 
 
+_DOMAIN_NAME_PARTS = (
+    "software", "exports", "export", "industries", "industry", "technology", "technologies",
+    "solutions", "solution", "services", "service", "systems", "system", "electronics",
+    "electricals", "electrical", "refrigeration", "logistics", "shipping", "trading",
+    "enterprise", "enterprises", "consulting", "consultancy", "corporation", "corporate",
+    "marine", "power", "green", "globe", "firm", "group", "india", "global", "digital",
+    "network", "engineering", "industrials", "automation",
+)
+_DOMAIN_NAME_PARTS = tuple(sorted(set(_DOMAIN_NAME_PARTS), key=len, reverse=True))
+
+
+def _domain_from_url(value: str | None) -> str:
+    host = re.sub(r"^https?://", "", value or "", flags=re.I).split("/", 1)[0]
+    return re.sub(r"^www\.", "", host, flags=re.I).rstrip(".").lower()
+
+
+def _company_name_from_domain(host: str) -> str:
+    """Format a domain-derived company suggestion without pretending it is verified."""
+    compact = re.sub(r"[^a-z0-9]", "", host.casefold())
+    tokens: list[str] = []
+    cursor = 0
+    while cursor < len(compact):
+        match = next((word for word in _DOMAIN_NAME_PARTS if compact.startswith(word, cursor)), None)
+        if match:
+            tokens.append(match.title())
+            cursor += len(match)
+            continue
+        next_match = min((position for word in _DOMAIN_NAME_PARTS
+                          if (position := compact.find(word, cursor + 1)) >= 0), default=len(compact))
+        tokens.append(compact[cursor:next_match].title())
+        cursor = next_match
+    return " ".join(token for token in tokens if token)
+
+
 def _explicit_fields(text: str) -> dict[str, list[str]]:
     """Read labelled values before heuristic classification can mix fields."""
     labels = {
@@ -592,8 +626,8 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     lines = _clean_lines(text)
     full_text = "\n".join(lines)
 
-    email_matches = re.finditer(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", full_text, re.I)
-    email_addresses = list(dict.fromkeys(match.group(0).rstrip(".,;") for match in email_matches))
+    email_pattern = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+    email_addresses = list(dict.fromkeys(match.group(0).rstrip(".,;") for match in email_pattern.finditer(full_text)))
     # Tesseract sometimes drops the dot after the conventional ``www`` prefix.
     full_text = re.sub(r"\bwww(?=[A-Za-z0-9-])", "www.", full_text, flags=re.I)
     url_pattern = re.compile(
@@ -610,6 +644,20 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                 social_links.setdefault(social_key, str(parsed_url[social_key]))
         if not any(parsed_url.get(key) for key in ("facebook_link", "instagram_link", "whatsapp_link")) and website is None:
             website = candidate_url
+    # OCR sometimes drops the dot before a familiar TLD (for example,
+    # ``name@companycom``). Repair it only when the candidate domain exactly
+    # matches the website printed on the same card after punctuation removal.
+    website_host = _domain_from_url(website)
+    recovered_email = False
+    if website_host:
+        compact_website_host = re.sub(r"[^a-z0-9]", "", website_host)
+        broken_email_pattern = re.compile(r"(?<![\w.+-])([A-Z0-9._%+-]+)@([A-Z0-9-]+)(?![A-Z0-9.-])", re.I)
+        for match in broken_email_pattern.finditer(full_text):
+            if re.sub(r"[^a-z0-9]", "", match.group(2).lower()) == compact_website_host:
+                corrected = f"{match.group(1)}@{website_host}"
+                if corrected not in email_addresses:
+                    email_addresses.append(corrected)
+                    recovered_email = True
     contact_numbers: list[str] = []
     phone_pattern = re.compile(r"(?<!\d)\+?\d(?:[ \t().-]*\d){6,14}(?!\d)")
     for line in lines:
@@ -671,6 +719,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     ]
     indic_owner_keys = {re.sub(r"[^\u0900-\u097f]", "", name) for name in indic_owner_candidates}
     indic_honorific_owner = indic_owner_candidates[0] if len(indic_owner_keys) == 1 and indic_owner_candidates else None
+    company_from_domain = False
     company = next((
         line for line in candidates
         if company_markers.search(line) and line != honorific_owner and not designation_markers.search(line)
@@ -711,7 +760,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         if explicit_company:
             company = explicit_company
         if website:
-            host = re.sub(r"^https?://|^www\.", "", website, flags=re.I).split(".")[0]
+            host = _domain_from_url(website).split(".")[0]
             matching_brand = next((line for line in company_candidates
                                    if re.sub(r"[^a-z0-9]", "", line.casefold()).startswith(re.sub(r"[^a-z0-9]", "", host.casefold()))
                                    or re.sub(r"[^a-z0-9]", "", host.casefold()).startswith(re.sub(r"[^a-z0-9]", "", line.casefold()))), None)
@@ -726,7 +775,8 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                             company = combined
                             break
             elif host and host.casefold() not in {"gmail", "yahoo", "google", "facebook", "instagram"}:
-                company = re.sub(r"[-_]+", " ", host).title()
+                company = _company_name_from_domain(host)
+                company_from_domain = True
         if company is None:
             company = next((line for line in company_candidates if company_markers.search(line)), None)
         if company is None:
@@ -772,7 +822,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         if corporation:
             company = f"{corporation.group(1).capitalize()} {((corporation.group(2) or '').capitalize() + ' ') if corporation.group(2) else ''}Corporation"
     if company and website:
-        host_key = re.sub(r"[^a-z0-9]", "", re.sub(r"^https?://|^www\.", "", website, flags=re.I).split(".")[0].casefold())
+        host_key = re.sub(r"[^a-z0-9]", "", _domain_from_url(website).split(".")[0])
         company_key = re.sub(r"[^a-z0-9]", "", company.casefold())
         if host_key and company_key.startswith(host_key):
             for partial, complete in (("logis", "logistics"), ("corpor", "corporation"), ("industri", "industries"), ("technolog", "technologies")):
@@ -828,10 +878,11 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     # website is safer evidence than treating a person's prominent name as a
     # company. Use the registered domain as a review candidate.
     if company and not company_markers.search(company) and website and (len(company.split()) == 1 or company.isupper()):
-        host = re.sub(r"^https?://|^www\.", "", website, flags=re.I).split(".")[0]
+        host = _domain_from_url(website).split(".")[0]
         if (host and host.casefold() not in {"gmail", "yahoo", "google", "facebook", "instagram"}
                 and re.sub(r"[^a-z0-9]", "", company.casefold()) != re.sub(r"[^a-z0-9]", "", host.casefold())):
-            company = re.sub(r"[-_]+", " ", host).title()
+            company = _company_name_from_domain(host)
+            company_from_domain = True
     before_designation = candidates[:candidates.index(designation)] if designation in candidates else candidates
     indic_context_owner = next((
         line for index, line in enumerate(lines)
@@ -935,6 +986,14 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         "registration_number": (explicit.get("registration_number") or [None])[0],
         "raw_text": _format_labeled_text(text),
     }
+    if company_from_domain:
+        parsed.setdefault("review_warnings", []).append(
+            "Company name is a suggestion from the website domain; verify its spelling and complete registered name."
+        )
+    if recovered_email:
+        parsed.setdefault("review_warnings", []).append(
+            "An email domain separator was restored using the matching website; verify the email against the card."
+        )
     # Stock business-card mockups print sample values that look like real
     # contacts (Lorem Ipsum, NAME SURNAME, sitename.domain, sample address).
     # Keep the transcript for verification, but never expose those values as

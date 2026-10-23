@@ -333,6 +333,36 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertEqual(fields["contact_numbers"], ["+91 9820782043", "+91 40956600"])
         self.assertEqual(fields["email_addresses"], ["hemendra.manohar@i2ifoundation.org"])
 
+    def test_screenshot_ocr_recovers_email_dot_only_from_matching_website(self) -> None:
+        source = (
+            "I do, w\nNayan Kagade\nDirector\n9112227422/8237478379\n"
+            "https://www.sanmolsoftware.com\n= nkagade@sanmolsoftwarecom\n"
+            "9 Office No 402, 4th Floor, 93 Avenue Solapur"
+        )
+        fields = _parse_fields(source)
+
+        self.assertEqual(fields["company_name"], "Sanmol Software")
+        self.assertEqual(fields["owner_name"], "Nayan Kagade")
+        self.assertEqual(fields["designation"], "Director")
+        self.assertEqual(fields["email_addresses"], ["nkagade@sanmolsoftware.com"])
+        self.assertTrue(any("suggestion from the website domain" in warning for warning in fields["review_warnings"]))
+        self.assertTrue(any("separator was restored" in warning for warning in fields["review_warnings"]))
+
+    def test_globefirm_screenshot_uses_domain_words_without_claiming_registered_name(self) -> None:
+        fields = _parse_fields(
+            "GLOBEFIRM\n+91- 8600150891 (/WhatsApp)\n"
+            "rohit shivraj@globefirmexports.com\nwww.globefirmexports.com"
+        )
+
+        self.assertEqual(fields["company_name"], "Globe Firm Exports")
+        self.assertEqual(fields["email_addresses"], ["shivraj@globefirmexports.com"])
+        self.assertTrue(any("complete registered name" in warning for warning in fields["review_warnings"]))
+
+    def test_broken_email_domain_is_not_repaired_without_matching_website(self) -> None:
+        fields = _parse_fields("Name Surname\nname@companycom")
+
+        self.assertEqual(fields["email_addresses"], [])
+
     def test_honorific_identifies_owner_and_larger_brand_line_identifies_company(self) -> None:
         fields = _parse_fields(
             "Mr. Rajesh Kumar\nBusiness Development Manager\nNivara Brand\n"
