@@ -1,8 +1,9 @@
 import unittest
+import re
 
 from PIL import Image, ImageDraw
 
-from backend.app.ocr import _parse_fields, _split_card_image
+from backend.app.ocr import _merge_qr_fields, _parse_fields, _split_card_image
 
 
 class CombinedCardImageTests(unittest.TestCase):
@@ -25,6 +26,16 @@ class CombinedCardImageTests(unittest.TestCase):
 
 
 class LeadFieldParsingTests(unittest.TestCase):
+    def test_explicit_qr_contact_overrides_ambiguous_ocr_value(self) -> None:
+        fields = _merge_qr_fields(
+            {"company_name": "Wrong OCR Brand", "owner_name": None, "contact_numbers": []},
+            ["BEGIN:VCARD\nFN:Jane Doe\nORG:Acme Solutions Pvt Ltd\nTITLE:Director\nTEL:+919876543210\nEND:VCARD"],
+        )
+        self.assertEqual(fields["company_name"], "Acme Solutions Pvt Ltd")
+        self.assertEqual(fields["owner_name"], "Jane Doe")
+        self.assertEqual(fields["designation"], "Director")
+        self.assertEqual(fields["contact_numbers"], ["+919876543210"])
+
     def test_certification_tagline_is_not_mapped_to_owner_or_designation(self) -> None:
         fields = _parse_fields(
             "Acme Solutions\nCertified Partner Of Premium Brands\nJane Doe\nDirector\n"
@@ -150,6 +161,30 @@ class LeadFieldParsingTests(unittest.TestCase):
         )
         self.assertEqual(fields["company_name"], "Barbows")
         self.assertEqual(fields["owner_name"], "KAPIL KADAM")
+
+    def test_gawade_card_keeps_registered_company_owner_and_address_separate(self) -> None:
+        fields = _parse_fields(
+            "Gawade Green Power Pvt. Ltd.\nDeepak Shivaji Gawade\nManaging Director\n"
+            "Mob - +91-9922512000\nceo@gawadegreenpower.com\nwww.gawadegreenpower.com\n"
+            "Office No. 210, 2nd Floor, Laxmi Complex, Chinchwad Pune - 411019, Maharashtra India"
+        )
+        self.assertEqual(fields["company_name"], "Gawade Green Power Pvt. Ltd.")
+        self.assertEqual(fields["owner_name"], "Deepak Shivaji Gawade")
+        self.assertEqual(fields["designation"], "Managing Director")
+        self.assertEqual(fields["contact_numbers"], ["+91-9922512000"])
+        self.assertIn("Laxmi Complex", fields["company_address"])
+
+    def test_business_cards_extract_non_latin_owner_and_title_as_latin_text(self) -> None:
+        from backend.app.ocr import _fields_from_ocr_text
+        marathi_source = "कंपनी लिमिटेड\nश्री अमित पाटील\nसंचालक\nपुणे महाराष्ट्र 411001\n+91 9876543210"
+        hindi_source = "अनमोल फैशन बुटीक\nश्रीमती मीनाक्षी वर्मा\nमालकिन\nपी रोड कानपुर 208012\n9305365913"
+        for source in (marathi_source, hindi_source):
+            with self.subTest(source=source):
+                fields = _fields_from_ocr_text(source)
+                for key in ("company_name", "owner_name", "designation", "company_address"):
+                    self.assertFalse(re.search(r"[\u0900-\u097f]", fields.get(key) or ""))
+                self.assertTrue(fields["contact_numbers"])
+                self.assertEqual(fields["original_ocr_text"], source)
 
 
 if __name__ == "__main__":

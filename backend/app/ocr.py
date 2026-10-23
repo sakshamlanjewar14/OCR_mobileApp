@@ -8,8 +8,15 @@ from pathlib import Path
 
 import pytesseract
 import pymupdf
+try:
+    import cv2
+    import numpy as np
+except ImportError:  # QR scanning remains optional for lightweight local installs.
+    cv2 = None
+    np = None
 from PIL import Image, ImageChops, ImageEnhance, ImageOps
 from .translation import translate_document_text, latin_name, latinize_document_text
+from .qr import parse_qr_payload
 
 
 configured_tesseract = os.getenv("TESSERACT_CMD", "").strip()
@@ -482,14 +489,28 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     if fuzzy_company and not legal_candidates and not raw_company_line:
         company = fuzzy_company
     if company is None:
+        # A plain person-like or slogan-like line is not enough evidence for a
+        # company name. Typography is intentionally not used as a classifier.
         company_candidates = [
             line for line in candidates
             if line != honorific_owner and not designation_markers.search(line)
             and not re.match(r"^(?:mr|mrs|ms|miss|dr|prof)\.?\s+", line, re.I)
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9&'.-]*(?:\s+[A-Za-z][A-Za-z0-9&'.-]*){0,5}", line)
         ]
-        if company_candidates:
-            heights = line_heights or {}
-            company = max(company_candidates, key=lambda line: heights.get(line.casefold(), 0)) if heights else company_candidates[0]
+        explicit_company = next(iter(explicit.get("company_name", [])), None)
+        if explicit_company:
+            company = explicit_company
+        if website:
+            host = re.sub(r"^https?://|^www\.", "", website, flags=re.I).split(".")[0]
+            matching_brand = next((line for line in company_candidates
+                                   if re.sub(r"[^a-z0-9]", "", line.casefold()).startswith(re.sub(r"[^a-z0-9]", "", host.casefold()))
+                                   or re.sub(r"[^a-z0-9]", "", host.casefold()).startswith(re.sub(r"[^a-z0-9]", "", line.casefold()))), None)
+            if matching_brand:
+                company = matching_brand
+            elif host and host.casefold() not in {"gmail", "yahoo", "google", "facebook", "instagram"}:
+                company = re.sub(r"[-_]+", " ", host).title()
+        if company is None:
+            company = next((line for line in company_candidates if company_markers.search(line)), None)
 
     # OCR commonly places legal suffixes on their own line (for example,
     # ``Example Industries Pvt.`` followed by ``Ltd.``). Keep those tokens in
@@ -500,11 +521,14 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         re.I,
     )
     if company:
-        company_index = candidates.index(company)
-        if company_index > 0 and legal_suffix_only.fullmatch(company):
-            company = f"{candidates[company_index - 1]} {company}"
-        elif company_index + 1 < len(candidates) and legal_suffix_only.fullmatch(candidates[company_index + 1]):
-            company = f"{company} {candidates[company_index + 1]}"
+        # Some valid values (such as a normalized website host) are synthesized
+        # from non-line evidence and therefore won't be present in candidates.
+        if company in candidates:
+            company_index = candidates.index(company)
+            if company_index > 0 and legal_suffix_only.fullmatch(company):
+                company = f"{candidates[company_index - 1]} {company}"
+            elif company_index + 1 < len(candidates) and legal_suffix_only.fullmatch(candidates[company_index + 1]):
+                company = f"{company} {candidates[company_index + 1]}"
     promotional_text = re.compile(
         r"\b(certified|authori[sz]ed|official|channel|solutions?|provider|dealer|distributor|welcome|quality|trusted|leading|serving)\b",
         re.I,
@@ -607,6 +631,49 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     }
 
 
+def _decode_qr_payloads(image: Image.Image) -> list[str]:
+    """Decode all visible QR codes without opening their URLs."""
+    if cv2 is None or np is None:
+        return []
+    try:
+        detector = cv2.QRCodeDetector()
+        pixels = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+        decoded: list[str] = []
+        ok, values, _, _ = detector.detectAndDecodeMulti(pixels)
+        if ok and values is not None:
+            decoded.extend(str(value).strip() for value in values if str(value).strip())
+        if not decoded:
+            value, _, _ = detector.detectAndDecode(pixels)
+            if value and value.strip():
+                decoded.append(value.strip())
+        return list(dict.fromkeys(decoded))
+    except (cv2.error, ValueError, TypeError):
+        return []
+
+
+def _merge_qr_fields(fields: dict[str, object], payloads: list[str]) -> dict[str, object]:
+    if not payloads:
+        return fields
+    merged = dict(fields)
+    parsed = [parse_qr_payload(payload) for payload in payloads]
+    for key in ("company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"):
+        values = [str(item[key]).strip() for item in parsed if item.get(key) and str(item[key]).strip()]
+        # Structured QR payloads are explicit contact data; prefer them over
+        # an ambiguous OCR guess when both sources contain a value.
+        if values:
+            merged[key] = values[0]
+    for key, result_key in (("contact_numbers", "contacts"), ("email_addresses", "emails")):
+        existing = list(merged.get(key) or [])
+        for item in parsed:
+            existing.extend(str(value).strip() for value in item.get(result_key, []) if str(value).strip())
+        if existing:
+            merged[key] = list(dict.fromkeys(existing))
+            merged["contact_number" if key == "contact_numbers" else "email"] = merged[key][0]
+    merged["qr_payloads"] = payloads
+    merged["qr_data"] = [item for item in parsed if not item.get("unmapped")]
+    return merged
+
+
 def extract_fields(path: Path, content_type: str) -> dict[str, object]:
     if content_type == "application/pdf":
         return _fields_from_ocr_text(_extract_text(path, content_type))
@@ -618,7 +685,7 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
             cards: list[dict[str, object]] = []
             for region in regions:
                 text, line_heights = _read_image_with_layout(region)
-                cards.append(_fields_from_ocr_text(text, line_heights))
+                cards.append(_merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(region)))
             cards = [card for card in cards if card.get("company_name") and (card.get("contact_numbers") or card.get("email_addresses") or card.get("website") or card.get("company_address"))]
             if len(cards) > 1:
                 primary = cards[0].copy()
@@ -629,7 +696,7 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
         # the unrotated pixels causes names and labels to swap fields.
         ocr_image = image.rotate(90, expand=True) if image.height > image.width * 1.25 else image
         text, line_heights = _read_image_with_layout(ocr_image)
-        return _fields_from_ocr_text(text, line_heights)
+        return _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(image) + _decode_qr_payloads(ocr_image))
 
 
 def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | None = None) -> dict[str, object]:

@@ -50,6 +50,8 @@ type ExtractedLeadFields = Omit<Partial<Record<keyof LeadForm, string | null>>, 
   original_ocr_text?: string | null;
   translation_status?: string | null;
   translation_message?: string | null;
+  qr_payloads?: string[];
+  qr_data?: Record<string, unknown>[];
 };
 type DocumentRecord = {
   id: string;
@@ -68,6 +70,20 @@ type RawCandidate = { source: string; row: number; fields: ExtractedLeadFields }
 type RawPreviewResult = { filename: string; candidates: { row: number; fields: ExtractedLeadFields }[] };
 type LeadPage = { leads: Lead[]; total: number; page: number; page_size: number };
 const LEADS_PAGE_SIZE = 50;
+
+function mergeExtractedFields(records: DocumentRecord[]): ExtractedLeadFields {
+  const merged: ExtractedLeadFields = {};
+  for (const key of ["company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
+    const value = records.map((record) => record.extracted_fields?.[key]).find((item) => typeof item === "string" && item.trim());
+    if (value) merged[key] = value as string;
+  }
+  merged.contact_numbers = stringValues(records.flatMap((record) => record.extracted_fields?.contact_numbers || []));
+  merged.email_addresses = stringValues(records.flatMap((record) => record.extracted_fields?.email_addresses || []));
+  merged.raw_text = records.map((record) => record.extracted_fields?.raw_text).filter((item): item is string => Boolean(item)).join("\n\n");
+  merged.original_ocr_text = records.map((record) => record.extracted_fields?.original_ocr_text).filter((item): item is string => Boolean(item)).join("\n\n");
+  merged.qr_payloads = records.flatMap((record) => record.extracted_fields?.qr_payloads || []);
+  return merged;
+}
 
 const emptyForm: LeadForm = {
   company_name: "",
@@ -121,6 +137,45 @@ function stringValues(values: string[] | null | undefined, fallback?: string | n
 
 function listFromText(value: string, separators: RegExp = /[\n;]+/): string[] {
   return value.split(separators).map((item) => item.trim()).filter(Boolean);
+}
+
+const EDITED_PREVIEW_MARKER = "[Edited preview]";
+function syncedRawText(form: LeadForm): string {
+  const base = form.raw_text.split(/\n\s*\[Edited preview\]\s*\n/i)[0].trimEnd();
+  const lines = [
+    ["Company name", form.company_name], ["Owner name", form.owner_name], ["Designation", form.designation],
+    ["Address", form.company_address], ["Contact numbers", form.contact_numbers.join("; ")],
+    ["Email addresses", form.email_addresses.join("; ")], ["Website", form.website],
+    ["Facebook", form.facebook_link], ["Instagram", form.instagram_link], ["WhatsApp", form.whatsapp_link],
+  ].filter(([, value]) => value.trim()).map(([label, value]) => `${label}: ${value}`);
+  return lines.length ? `${base}\n\n${EDITED_PREVIEW_MARKER}\n${lines.join("\n")}`.trim() : base;
+}
+
+function updateFormField(current: LeadForm, patch: Partial<LeadForm>): LeadForm {
+  const next = { ...current, ...patch };
+  return { ...next, raw_text: syncedRawText(next) };
+}
+
+function updateFormFromDocumentText(current: LeadForm, rawText: string): LeadForm {
+  const next: Partial<LeadForm> = {};
+  const value = (label: string) => rawText.match(new RegExp(`^\\s*${label}\\s*:\\s*(.+)$`, "im"))?.[1]?.trim() || "";
+  const company = value("(?:full\\s+)?company(?:\\s+name)?");
+  const owner = value("owner(?:\\s+name)?|contact(?:\\s+person)?");
+  const designation = value("designation|title|position");
+  const address = value("address");
+  const contact = value("contact(?:\\s+numbers?)?|phone(?:\\s+numbers?)?");
+  const emails = value("emails?|email\\s+addresses?");
+  if (company) next.company_name = company;
+  if (owner) next.owner_name = owner;
+  if (designation) next.designation = designation;
+  if (address) next.company_address = address;
+  if (contact) next.contact_numbers = listFromText(contact, /[;,]+/);
+  if (emails) next.email_addresses = listFromText(emails, /[;,]+/);
+  for (const [key, label] of [["website", "website"], ["facebook_link", "facebook"], ["instagram_link", "instagram"], ["whatsapp_link", "whatsapp"]] as const) {
+    const item = value(label);
+    if (item) next[key] = item;
+  }
+  return { ...current, ...next, raw_text: rawText };
 }
 
 function mergeValues(current: string[], extracted?: string[] | null): string[] {
@@ -303,6 +358,9 @@ function App() {
   const [rawCandidateIndex, setRawCandidateIndex] = useState(0);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraError, setCameraError] = useState("");
+  const [cameraFiles, setCameraFiles] = useState<File[]>([]);
+  const [batchAsOneLead, setBatchAsOneLead] = useState(false);
+  const [sourceDocumentIds, setSourceDocumentIds] = useState<string[]>([]);
   const [form, setForm] = useState<LeadForm>(emptyForm);
   const [editingLead, setEditingLead] = useState<Lead | null>(null);
   const [viewingLead, setViewingLead] = useState<Lead | null>(null);
@@ -400,7 +458,12 @@ function App() {
           const completed = updated.find((item) => (!reviewBatchIds.length || reviewBatchIds.includes(item.id)) && (item.processing_status === "needs_review" || item.processing_status === "failed"));
           if (completed && !rawCandidates.length && (!document || document.id === completed.id)) {
             try {
-              const fullDocument = await api<DocumentRecord>(`/documents/${completed.id}`);
+              const batchDocuments = batchAsOneLead && reviewBatchIds.length > 1
+                ? await Promise.all(reviewBatchIds.map((id) => api<DocumentRecord>(`/documents/${id}`)))
+                : [await api<DocumentRecord>(`/documents/${completed.id}`)];
+              const fullDocument = batchDocuments.length > 1
+                ? { ...batchDocuments[0], original_filename: batchDocuments.map((item) => item.original_filename).join(" + "), extracted_fields: mergeExtractedFields(batchDocuments) }
+                : batchDocuments[0];
               setDocument(fullDocument);
               setForm(formFromExtracted(fullDocument.extracted_fields || {}));
               setTab("form");
@@ -417,9 +480,9 @@ function App() {
         setError(err instanceof Error ? `${err.message}. Status checks will retry automatically.` : "Could not check document status. Status checks will retry automatically.");
         setPendingDocuments((current) => [...current]);
       }
-    }, 1400);
+    }, 500);
     return () => window.clearTimeout(timer);
-  }, [pendingDocuments, loadScanIssues, rawCandidates.length, document, reviewBatchIds]);
+  }, [pendingDocuments, loadScanIssues, rawCandidates.length, document, reviewBatchIds, batchAsOneLead]);
 
   const title = editingLead ? "Edit lead" : "Add lead";
   const formFingerprint = JSON.stringify(form);
@@ -438,7 +501,7 @@ function App() {
     if (files.length) await uploadFiles(files);
   }
 
-  async function uploadFiles(files: File[]) {
+  async function uploadFiles(files: File[], asOneLead = false) {
     if (!files.length) return;
     setError("");
     setNotice("");
@@ -448,6 +511,8 @@ function App() {
     setForm(emptyForm);
     setRawCandidates([]);
     setReviewBatchIds([]);
+    setSourceDocumentIds([]);
+    setBatchAsOneLead(asOneLead);
     const rawFiles = files.filter((file) => /\.(txt|csv|xlsx)$/i.test(file.name));
     if (rawFiles.length) {
       setSearch("");
@@ -495,6 +560,7 @@ function App() {
       setPendingDocuments(uploadedDocuments);
       setScanIssues((current) => mergeDocuments(current, uploadedDocuments));
       setReviewBatchIds(uploadedDocuments.map((item) => item.id));
+      setSourceDocumentIds(uploadedDocuments.map((item) => item.id));
       if (!rawFiles.length && uploadedDocuments.length) {
         setForm(formFromExtracted(uploadedDocuments[0].extracted_fields || {}));
         setTab("form");
@@ -572,8 +638,19 @@ function App() {
       setCameraError("Could not capture the photo. Try again or upload an image.");
       return;
     }
+    setCameraFiles((current) => [...current, new File([blob], `camera-${Date.now()}.jpg`, { type: "image/jpeg" })]);
+    setCameraError("");
+  }
+
+  async function finishCameraScan() {
+    if (!cameraFiles.length) {
+      setCameraError("Capture at least one image first.");
+      return;
+    }
     setCameraOpen(false);
-    await uploadFiles([new File([blob], `camera-${Date.now()}.jpg`, { type: "image/jpeg" })]);
+    const files = cameraFiles;
+    setCameraFiles([]);
+    await uploadFiles(files, files.length > 1);
   }
 
   async function retryDocument(source: DocumentRecord) {
@@ -691,6 +768,8 @@ function App() {
       instagram_link: form.instagram_link || null,
       whatsapp_link: form.whatsapp_link || null,
       document_id: document?.id || null,
+      source_document_ids: sourceDocumentIds,
+      source_sides: sourceDocumentIds.map((_, index) => index === 0 ? "front" : "back"),
       document_card_index: document?.extracted_fields.cards && document.extracted_fields.cards.length > 1 ? activeCardIndex : null,
       original_ocr_text: editingLead?.original_ocr_text || textValue(document?.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document?.extracted_fields.original_ocr_text) || null,
       source_review_confirmed: !needsSourceReview || sourceReviewConfirmed,
@@ -826,7 +905,7 @@ function App() {
           <div><p className="eyebrow">BUSINESS CONTACTS</p><h1>{tab === "form" ? title : "Your leads"}</h1>
             <p className="subheading">Scan business documents and keep your contacts in one place.</p></div>
           <div className="upload-actions">
-            <button className="button button-secondary" type="button" onClick={() => setCameraOpen(true)}>Open camera</button>
+            <button className="button button-secondary" type="button" onClick={() => { setCameraFiles([]); setCameraError(""); setCameraOpen(true); }}>Open camera</button>
             <label className="button button-primary upload-button"><span aria-hidden="true">＋</span> Upload files
               <input type="file" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.gif,.pdf,.zip,.txt,.csv,.xlsx" onChange={upload} />
             </label>
@@ -873,7 +952,7 @@ function App() {
               <td>{lead.owner_name || <span className="muted">—</span>}</td>
               <td>{lead.designation || <span className="muted">—</span>}</td>
               <td className="address-cell">{lead.company_address || <span className="muted">—</span>}</td>
-              <td><div className="cell-stack">{(lead.contact_numbers?.length ? lead.contact_numbers : lead.contact_number ? [lead.contact_number] : []).map((number) => <span key={number}>{indianPhone(number)}</span>)}{!(lead.contact_numbers?.length || lead.contact_number) && <span className="muted">—</span>}</div></td>
+              <td><div className="cell-stack">{(lead.contact_numbers?.length ? lead.contact_numbers : lead.contact_number ? [lead.contact_number] : []).map((number) => <a key={number} href={`tel:${number.replace(/[^+\d]/g, "")}`}>{indianPhone(number)}</a>)}{!(lead.contact_numbers?.length || lead.contact_number) && <span className="muted">—</span>}</div></td>
               <td><div className="cell-stack">{lead.email_addresses?.length ? lead.email_addresses.map((address) => <a key={address} href={`mailto:${address}`}>{address}</a>) : lead.email ? <a href={`mailto:${lead.email}`}>{lead.email}</a> : <span className="muted">—</span>}</div></td>
               <td>{lead.website ? <a href={lead.website.startsWith("http") ? lead.website : `https://${lead.website}`} target="_blank" rel="noreferrer">{lead.website}</a> : <span className="muted">—</span>}</td>
               <td><div className="cell-stack">{lead.facebook_link && <a href={lead.facebook_link} target="_blank" rel="noreferrer">Facebook</a>}{lead.instagram_link && <a href={lead.instagram_link} target="_blank" rel="noreferrer">Instagram</a>}{lead.whatsapp_link && <a href={lead.whatsapp_link} target="_blank" rel="noreferrer">WhatsApp</a>}{!lead.facebook_link && !lead.instagram_link && !lead.whatsapp_link && <span className="muted">—</span>}</div></td>
@@ -903,11 +982,11 @@ function App() {
               <div className="form-heading"><span className="eyebrow">LEAD INFORMATION</span><h2>{editingLead ? editingLead.lead_number : document?.extracted_fields.cards && document.extracted_fields.cards.length > 1 ? `Card ${activeCardIndex + 1} of ${document.extracted_fields.cards.length}` : "Add lead"}</h2><p>{editingLead ? "Correct any details, then save your changes." : "Enter the company information and save the lead."}</p></div>
               <form onSubmit={saveLead}>
                 {fields.map((field) => <label className="field" key={field.key}><span>{field.label}{field.key === "company_name" && <b>Required</b>}</span>
-                {field.key === "company_address" ? <textarea rows={3} value={form.company_address} onChange={(event) => setForm((current) => ({ ...current, company_address: event.target.value }))} placeholder={field.placeholder} /> : <input value={form[field.key] || ""} onChange={(event) => setForm((current) => ({ ...current, [field.key]: event.target.value }))} placeholder={field.placeholder} required={field.key === "company_name"} />}
+                {field.key === "company_address" ? <textarea rows={3} value={form.company_address} onChange={(event) => setForm((current) => updateFormField(current, { company_address: event.target.value }))} placeholder={field.placeholder} /> : <input value={form[field.key] || ""} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} required={field.key === "company_name"} />}
                 </label>)}
-                <label className="field"><span>Contact numbers <small>One per line</small></span><textarea rows={3} value={form.contact_numbers.join("\n")} onChange={(event) => setForm((current) => ({ ...current, contact_numbers: listFromText(event.target.value) }))} placeholder={"+91 98765 43210\n+91 98765 43211"} /></label>
-                <label className="field"><span>Email addresses <small>One per line</small></span><textarea rows={3} value={form.email_addresses.join("\n")} onChange={(event) => setForm((current) => ({ ...current, email_addresses: listFromText(event.target.value, /[\n;,]+/) }))} placeholder="name@company.com&#10;sales@company.com" /></label>
-                <label className="field"><span>Other text from document <small>Editable OCR text; keeps details that do not fit another field</small></span><textarea className="raw-text-area" rows={6} value={form.raw_text} onChange={(event) => setForm((current) => ({ ...current, raw_text: event.target.value }))} placeholder="All readable text from the source document appears here." /></label>
+                <label className="field"><span>Contact numbers <small>One per line</small></span><textarea rows={3} value={form.contact_numbers.join("\n")} onChange={(event) => setForm((current) => updateFormField(current, { contact_numbers: listFromText(event.target.value) }))} placeholder={"+91 98765 43210\n+91 98765 43211"} /></label>
+                <label className="field"><span>Email addresses <small>One per line</small></span><textarea rows={3} value={form.email_addresses.join("\n")} onChange={(event) => setForm((current) => updateFormField(current, { email_addresses: listFromText(event.target.value, /[\n;,]+/) }))} placeholder="name@company.com&#10;sales@company.com" /></label>
+                <label className="field"><span>Other text from document <small>Edit labeled lines here to update the matching fields automatically</small></span><textarea className="raw-text-area" rows={6} value={form.raw_text} onChange={(event) => setForm((current) => updateFormFromDocumentText(current, event.target.value))} placeholder="All readable text from the source document appears here." /></label>
                 {needsSourceReview && <section className="review-check" aria-labelledby="review-check-title">
                   <h3 id="review-check-title">Check details before saving</h3>
                   {!hasOcrText ? <p className="review-warning">Source text is unavailable. Compare every field directly with the original source.</p> : mismatches.length ? <><p className="review-warning">Check these possible mismatches against the original. Correct any errors before saving:</p><ul>{mismatches.map((item) => <li key={item}>{item}</li>)}</ul></> : <p className="review-match">Structured values are consistent with the stored source text. OCR can still misread characters, so compare them with the original source.</p>}
@@ -918,7 +997,7 @@ function App() {
             </div>
           </section>
         )}
-        {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture a business card</h2></div><button className="details-close" aria-label="Close camera" onClick={() => setCameraOpen(false)}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => setCameraOpen(false)}>Cancel</button><button className="button button-primary" onClick={() => void capturePhoto()}>Capture and scan</button></div></section></div>}
+        {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture card images</h2><p>{cameraFiles.length ? `${cameraFiles.length} image${cameraFiles.length === 1 ? "" : "s"} captured. Capture the back side too, then scan.` : "Capture the front side, then optionally capture the back side."}</p></div><button className="details-close" aria-label="Close camera" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>Cancel</button><button className="button button-secondary" onClick={() => void capturePhoto()}>Capture {cameraFiles.length ? "another" : "image"}</button><button className="button button-primary" onClick={() => void finishCameraScan()} disabled={!cameraFiles.length}>Scan {cameraFiles.length || ""} image{cameraFiles.length === 1 ? "" : "s"}</button></div></section></div>}
         {viewingLead && <div className="details-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setViewingLead(null); }}>
           <section className="details-dialog" role="dialog" aria-modal="true" aria-labelledby="details-title">
             <header className="details-heading"><div><span className="eyebrow">LEAD DETAILS</span><h2 id="details-title">{viewingLead.company_name}</h2><p>{viewingLead.lead_number}</p></div><button className="details-close" aria-label="Close details" onClick={() => setViewingLead(null)}>×</button></header>
@@ -927,7 +1006,7 @@ function App() {
               <div><dt>Owner / contact</dt><dd>{viewingLead.owner_name || "—"}</dd></div>
               <div><dt>Designation</dt><dd>{viewingLead.designation || "—"}</dd></div>
               <div><dt>Address</dt><dd>{viewingLead.company_address || "—"}</dd></div>
-              <div><dt>Contact numbers</dt><dd>{(viewingLead.contact_numbers?.length ? viewingLead.contact_numbers : viewingLead.contact_number ? [viewingLead.contact_number] : []).length ? (viewingLead.contact_numbers?.length ? viewingLead.contact_numbers : [viewingLead.contact_number!]).map((number) => <span className="detail-value" key={number}>{indianPhone(number)}</span>) : "—"}</dd></div>
+              <div><dt>Contact numbers</dt><dd>{(viewingLead.contact_numbers?.length ? viewingLead.contact_numbers : viewingLead.contact_number ? [viewingLead.contact_number] : []).length ? (viewingLead.contact_numbers?.length ? viewingLead.contact_numbers : [viewingLead.contact_number!]).map((number) => <a className="detail-value" key={number} href={`tel:${number.replace(/[^+\d]/g, "")}`}>{indianPhone(number)}</a>) : "—"}</dd></div>
               <div><dt>Email addresses</dt><dd>{(viewingLead.email_addresses?.length ? viewingLead.email_addresses : viewingLead.email ? [viewingLead.email] : []).length ? (viewingLead.email_addresses?.length ? viewingLead.email_addresses : [viewingLead.email!]).map((address) => <a className="detail-value" key={address} href={`mailto:${address}`}>{address}</a>) : "—"}</dd></div>
               <div><dt>Website</dt><dd>{viewingLead.website ? <a href={viewingLead.website.startsWith("http") ? viewingLead.website : `https://${viewingLead.website}`} target="_blank" rel="noreferrer">{viewingLead.website}</a> : "—"}</dd></div>
               <div><dt>Facebook</dt><dd>{viewingLead.facebook_link ? <a href={viewingLead.facebook_link} target="_blank" rel="noreferrer">{viewingLead.facebook_link}</a> : "—"}</dd></div>
