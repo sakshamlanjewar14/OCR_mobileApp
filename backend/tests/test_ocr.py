@@ -1,9 +1,22 @@
 import unittest
 import re
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from backend.app.ocr import _merge_qr_fields, _parse_fields, _split_card_image
+from backend.app.ocr import _merge_qr_fields, _parse_fields, _read_image_with_layout, _split_card_image
+
+
+class OCRLatencyRegressionTests(unittest.TestCase):
+    def test_windows_fallback_uses_one_ocr_read_without_layout_retries(self) -> None:
+        image = Image.new("RGB", (720, 420), "white")
+        with patch("backend.app.ocr._uses_windows_ocr_fallback", return_value=True), \
+             patch("backend.app.ocr._windows_ocr", return_value="Acme Business Card") as windows_ocr:
+            text, heights = _read_image_with_layout(image)
+
+        self.assertEqual(text, "Acme Business Card")
+        self.assertEqual(heights, {})
+        windows_ocr.assert_called_once_with(image)
 
 
 class CombinedCardImageTests(unittest.TestCase):

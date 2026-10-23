@@ -38,6 +38,15 @@ class OCRUnavailableError(RuntimeError):
     """Raised when neither the configured OCR engine nor Windows OCR can run."""
 
 
+def _tesseract_available() -> bool:
+    command = str(pytesseract.pytesseract.tesseract_cmd)
+    return Path(command).is_file() or shutil.which(command) is not None
+
+
+def _uses_windows_ocr_fallback() -> bool:
+    return os.name == "nt" and not _tesseract_available()
+
+
 def _windows_ocr(image: Image.Image) -> str:
     script = Path(__file__).with_name("windows_ocr.ps1")
     powershell = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
@@ -66,13 +75,17 @@ def _windows_ocr(image: Image.Image) -> str:
     try:
         best_image = image
         best_text = recognize(image)
-        if len(re.sub(r"[^A-Za-z0-9]", "", best_text)) < 80:
-            for angle in (90, 180, 270):
-                rotated_image = image.rotate(angle, expand=True)
-                rotated_text = recognize(rotated_image)
-                if len(re.sub(r"[^A-Za-z0-9]", "", rotated_text)) > len(re.sub(r"[^A-Za-z0-9]", "", best_text)):
-                    best_text = rotated_text
-                    best_image = rotated_image
+        # extract_fields already rotates portrait phone captures to make the
+        # card landscape. Only retry a portrait page, where a 90-degree turn is
+        # plausible; spawning three more PowerShell processes for every image
+        # made a normal scan take several seconds on Windows.
+        readable = lambda value: sum(char.isalnum() for char in value)
+        if readable(best_text) < 80 and image.height > image.width * 1.25:
+            rotated_image = image.rotate(90, expand=True)
+            rotated_text = recognize(rotated_image)
+            if readable(rotated_text) > readable(best_text):
+                best_text = rotated_text
+                best_image = rotated_image
 
         # Faded card-print often turns the letters PVT into ``.17.``. Run a
         # contrast-enhanced pass only for that suspicious company-line pattern;
@@ -111,6 +124,12 @@ def _read_image(image: Image.Image) -> str:
 
 def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
     """Read OCR lines and their text heights so prominent brand text can be preferred."""
+    # Windows OCR is the local fallback when Tesseract is not installed. It
+    # cannot provide word boxes, so avoid calling it again for synthetic page
+    # segmentation passes.
+    if _uses_windows_ocr_fallback():
+        return _windows_ocr(image), {}
+
     def read(config: str = "") -> tuple[str, dict[str, int]]:
         try:
             data = pytesseract.image_to_data(image, lang=os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar"), config=config, output_type=pytesseract.Output.DICT)
@@ -147,10 +166,6 @@ def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
         text_score = len(re.findall(r"[\u0900-\u097F]", text)) + 3 * len(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\+?\d[\d ()-]{7,}", text, re.I))
         if alternate_score > text_score:
             text, heights = alternate, alternate_heights
-    if not re.search(r"[\u0900-\u097F]", text):
-        indic_text, indic_heights = read("--psm 12")
-        if len(re.findall(r"[\u0900-\u097F]", indic_text)) >= 3:
-            text, heights = indic_text, indic_heights
     return (text or _read_image(image)), heights
 
 
@@ -695,6 +710,16 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
         # held upright while the physical landscape card was sideways. OCR on
         # the unrotated pixels causes names and labels to swap fields.
         ocr_image = image.rotate(90, expand=True) if image.height > image.width * 1.25 else image
+        # Tesseract cost grows sharply with pixel count. Keep crisp card text
+        # while bounding memory and recognition time for full-resolution phone
+        # captures; the original image remains stored untouched.
+        longest_side = max(ocr_image.size)
+        if longest_side > 2200:
+            scale = 2200 / longest_side
+            ocr_image = ocr_image.resize(
+                (max(1, round(ocr_image.width * scale)), max(1, round(ocr_image.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
         text, line_heights = _read_image_with_layout(ocr_image)
         return _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(image) + _decode_qr_payloads(ocr_image))
 
