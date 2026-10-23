@@ -80,7 +80,9 @@ export default function App() {
     setSides(current => [...current.filter(item => item.side !== side), next].sort((a,b) => a.side === 'front' ? -1 : b.side === 'front' ? 1 : 0));
   };
   const chooseImage = async (side: 'front'|'back') => {
-    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes:['images'], quality:0.9 });
+    // Business cards remain readable at this compression while uploads over
+    // mobile data are substantially smaller than the original camera image.
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes:['images'], quality:0.72 });
     if (!result.canceled && result.assets[0]) {
       putSide(side, result.assets[0]); setError('');
       try { const codes = await Camera.scanFromURLAsync(result.assets[0].uri, ['qr']); setQrPayloads(current => [...new Set([...current, ...codes.map(code=>code.data)])]); }
@@ -89,7 +91,7 @@ export default function App() {
   };
   const takePhoto = async () => {
     if (!camera.current) return;
-    try { const photo = await camera.current.takePictureAsync({ quality:0.9 }); if (photo) { const side=sides.some(x=>x.side==='front') ? 'back' : 'front'; putSide(side, { uri:photo.uri, fileName:`card-${Date.now()}.jpg` }); try { const codes=await Camera.scanFromURLAsync(photo.uri,['qr']); setQrPayloads(current=>[...new Set([...current,...codes.map(code=>code.data)])]); } catch {} setCameraOn(false); } }
+    try { const photo = await camera.current.takePictureAsync({ quality:0.72 }); if (photo) { const side=sides.some(x=>x.side==='front') ? 'back' : 'front'; putSide(side, { uri:photo.uri, fileName:`card-${Date.now()}.jpg` }); try { const codes=await Camera.scanFromURLAsync(photo.uri,['qr']); setQrPayloads(current=>[...new Set([...current,...codes.map(code=>code.data)])]); } catch {} setCameraOn(false); } }
     catch { setError('Camera could not capture this image. Try again or choose a photo.'); }
   };
   const onBarcode = (result: BarcodeScanningResult) => { setQrPayloads(current => current.includes(result.data) ? current : [...current,result.data]); };
@@ -104,7 +106,7 @@ export default function App() {
       for (let attempt=0; attempt<100; attempt++) {
         const statuses = await request<{id:string;processing_status:string;error_message:string|null}[]>('/documents/status', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:docs.map(d=>d.id)}) });
         if (statuses.every(x=>['needs_review','failed','saved'].includes(x.processing_status))) break;
-        await new Promise(resolve=>setTimeout(resolve,1000));
+        await new Promise(resolve=>setTimeout(resolve,500));
       }
       const ready = await Promise.all(docs.map(doc=>request<Doc>(`/documents/${doc.id}`)));
       const failed = ready.find(doc=>doc.processing_status==='failed'); if (failed) throw new Error(failed.error_message || 'OCR could not read one side. You can still review by entering the details manually.');
