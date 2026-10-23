@@ -122,6 +122,14 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertEqual(fields["contact_numbers"], ["+91 86558 73467"])
         self.assertEqual(fields["website"], "www.vasturaviraj.co.in")
 
+    def test_sample_vastu_noisy_marketing_executive_line_is_normalized(self) -> None:
+        fields = _parse_fields(
+            "VASTU\nRAVIRAJ\nChanging Lives, Changing Karma\nAmit Nalawade\n"
+            "Marketing Execatbeg | oh =\n+91 86558 73467"
+        )
+        self.assertEqual(fields["company_name"], "VASTU RAVIRAJ")
+        self.assertEqual(fields["designation"], "Marketing Executive")
+
     def test_sample_aditi_card_recovers_company_suffix_from_matching_email(self) -> None:
         fields = _parse_fields(
             "Yuvraj Phalke\nAditi Sales Corpor\nHouse of O Rings & Seals\n"

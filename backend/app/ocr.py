@@ -720,7 +720,8 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     designation = next(
         (
             line for line in lines
-            if (designation_markers.search(line) or re.fullmatch(r"(?:managing\s+)?partner", line, re.I))
+            if (designation_markers.search(line) or re.fullmatch(r"(?:managing\s+)?partner", line, re.I)
+                or re.match(r"^marketing\s+exec\w*", line, re.I))
             and not promotional_text.search(line) and line != company
         ),
         None,
@@ -1006,6 +1007,8 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
         field_review_warnings.append("Owner/contact name was not confidently identified. Check the original card.")
     if not fields.get("designation"):
         field_review_warnings.append("No designation was confidently identified. Confirm whether one is printed on the card.")
+    if not fields.get("email_addresses") and not fields.get("website"):
+        field_review_warnings.append("No email address or website was confidently identified. Check the source card.")
     if field_review_warnings:
         fields["review_warnings"] = field_review_warnings
     if status == "unavailable" and not fields.get("translation_message"):
