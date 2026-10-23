@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import textwrap
+import threading
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -25,6 +26,7 @@ from .ocr import OCRUnavailableError, _parse_fields, extract_fields
 from .qr import parse_qr_payload
 from .geocoding import reverse_geocode
 from .schemas import DocumentRead, DocumentStatusRead, DocumentStatusRequest, LeadCreate, LeadFields, LeadRead, LeadUpdate, QRParseRequest, ReverseGeocodeRequest
+from .translation import warm_translation_model
 
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads")).resolve()
@@ -56,6 +58,11 @@ app.add_middleware(
 def initialize_database() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    if engine.dialect.name == "sqlite":
+        columns = {column["name"] for column in inspect(engine).get_columns("leads")}
+        if "business_description" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE leads ADD COLUMN business_description TEXT"))
     if engine.dialect.name == "postgresql":
         columns = {column["name"] for column in inspect(engine).get_columns("leads")}
         document_unique_constraints = [
@@ -64,6 +71,7 @@ def initialize_database() -> None:
         ]
         additions = {
             "designation": "VARCHAR(120)",
+            "business_description": "TEXT",
             "raw_text": "TEXT",
             "verification_status": "VARCHAR(20) NOT NULL DEFAULT 'verified'",
             "source_card_index": "INTEGER",
@@ -140,6 +148,9 @@ def initialize_database() -> None:
             document.error_message = "Scanning was interrupted. Retry the scan; the uploaded source file is still available."
         if interrupted:
             db.commit()
+    translation_dir = os.getenv("TRANSLATION_MODEL_DIR", "").strip()
+    if translation_dir and Path(translation_dir).is_dir():
+        threading.Thread(target=warm_translation_model, name="ocr-translation-warmup", daemon=True).start()
 
 
 
@@ -426,6 +437,7 @@ RAW_FIELD_HEADERS = {
     "company_name": {"company", "company name", "company full name", "full company name", "legal company name", "registered company name", "business", "business name", "firm", "firm name", "organization", "organization name", "organisation", "organisation name"},
     "owner_name": {"owner", "owner name", "owner full name", "contact person", "contact person name", "primary contact name", "contact name", "person name", "full name", "proprietor", "proprietor name", "director name"},
     "designation": {"designation", "job title", "title", "position", "role", "work title"},
+    "business_description": {"description", "business description", "company description", "services", "products and services"},
     "company_address": {"address", "company address", "office address", "business address", "registered address", "registered office", "office location", "location"},
     "website": {"website", "web site", "company website", "website url", "web address", "company url", "url", "domain"},
     "facebook_link": {"facebook", "facebook link", "facebook url", "fb link"},
@@ -485,7 +497,7 @@ def _raw_row_fields(headers: list[str], values: list[object]) -> dict[str, objec
     raw_text = "\n".join(f"{header}: {value}" for header, value in recognized_pairs)
     if not has_company_header:
         parsed = _parse_fields(raw_text)
-        for field in ("company_name", "owner_name", "designation", "company_address", "website"):
+        for field in ("company_name", "owner_name", "designation", "business_description", "company_address", "website"):
             if parsed.get(field):
                 mapped[field] = parsed[field]
         mapped["contact_numbers"].extend(parsed.get("contact_numbers", []))
@@ -624,7 +636,7 @@ def _require_english_ocr(values: dict) -> None:
     # `raw_text` is the source/document transcript and may intentionally keep
     # the original Hindi or Marathi text. Only structured lead fields must be
     # Latin-letter values; `original_ocr_text` preserves the untouched source.
-    fields = ("company_name", "owner_name", "designation", "company_address")
+    fields = ("company_name", "owner_name", "designation", "business_description", "company_address")
     remaining = [key for key in fields if re.search(r"[\u0900-\u097f]", str(values.get(key) or ""))]
     if remaining:
         raise HTTPException(status_code=422, detail="Enter English/Latin-letter values before saving: " + ", ".join(remaining) + ". Re-scan and translate, or correct the preview manually. Original OCR text is kept separately.")
@@ -744,7 +756,7 @@ def update_lead(lead_id: str, payload: LeadUpdate, db: Session = Depends(get_db)
     if "company_name" in updates and updates["company_name"] is None:
         raise HTTPException(status_code=422, detail="Company name is required.")
     if lead.document_id or updates.get("original_ocr_text", lead.original_ocr_text):
-        _require_english_ocr({key: updates.get(key, getattr(lead, key)) for key in ("company_name", "owner_name", "designation", "company_address", "raw_text")})
+        _require_english_ocr({key: updates.get(key, getattr(lead, key)) for key in ("company_name", "owner_name", "designation", "business_description", "company_address", "raw_text")})
     contact_fields = {"contact_number", "contact_numbers", "email", "email_addresses"}
     for key, value in updates.items():
         if key not in contact_fields:
@@ -804,7 +816,7 @@ def delete_lead(lead_id: str, db: Session = Depends(get_db)):
 EXPORT_LEAD_HEADERS = [
     "S.No.", "Autogenerated ID", "Company name", "Owner name", "Designation", "Company address", "Data check",
 ]
-EXPORT_END_HEADERS = ["Website", "Facebook link", "Instagram link", "WhatsApp link", "Other document text"]
+EXPORT_END_HEADERS = ["Website", "Facebook link", "Instagram link", "WhatsApp link", "Business description", "Other document text"]
 
 
 @app.get("/api/exports/leads")
@@ -866,7 +878,7 @@ def export_leads(
     export_query = statement.with_only_columns(
         Lead.id, Lead.lead_number, Lead.company_name, Lead.owner_name, Lead.designation,
         Lead.company_address, Lead.verification_status, Lead.website, Lead.facebook_link,
-        Lead.instagram_link, Lead.whatsapp_link, Lead.raw_text,
+        Lead.instagram_link, Lead.whatsapp_link, Lead.business_description, Lead.raw_text,
         maintain_column_froms=True,
     ).where(Lead.id.in_(select(selected_ids.c.id))).order_by(Lead.created_at.desc(), Lead.id.desc())
     row_count = 0
@@ -895,7 +907,7 @@ def export_leads(
                 row_count + row_offset + 1, row.lead_number, row.company_name, row.owner_name, row.designation, row.company_address, row.verification_status,
                 *contact_numbers, *([None] * (phone_column_count - len(contact_numbers))),
                 *email_addresses, *([None] * (email_column_count - len(email_addresses))),
-                row.website, row.facebook_link, row.instagram_link, row.whatsapp_link, row.raw_text,
+                row.website, row.facebook_link, row.instagram_link, row.whatsapp_link, row.business_description, row.raw_text,
             ]
             safe_values = [values[0], *(str(value) if value is not None else "" for value in values[1:])]
             sheet.append(safe_values)

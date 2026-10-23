@@ -4,10 +4,28 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from backend.app.ocr import _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _split_card_image
+from backend.app.ocr import _decode_qr_payloads, _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _read_recovery_crops, _split_card_image
 
 
 class OCRLatencyRegressionTests(unittest.TestCase):
+    def test_recovery_crops_keep_hindi_and_marathi_language_models_for_landscape_cards(self) -> None:
+        image = Image.new("RGB", (900, 500), "white")
+        with patch.dict("os.environ", {"TESSERACT_LANGUAGES": "eng+hin+mar"}), \
+             patch("backend.app.ocr._uses_windows_ocr_fallback", return_value=False), \
+             patch("backend.app.ocr.pytesseract.image_to_string", return_value="कंपनी") as recognize:
+            _read_recovery_crops(image)
+        self.assertEqual(recognize.call_count, 2)
+        self.assertEqual({call.kwargs["lang"] for call in recognize.call_args_list}, {"eng+hin+mar"})
+
+    def test_qr_decoder_upscales_small_printed_codes(self) -> None:
+        import cv2
+        import numpy as np
+        payload = "https://example.com/card"
+        qr = cv2.QRCodeEncoder_create().encode(payload)
+        # A small rendered card QR should still decode after the bounded 2x pass.
+        image = Image.fromarray(cv2.cvtColor(cv2.resize(qr, (84, 84)), cv2.COLOR_GRAY2RGB))
+        self.assertEqual(_decode_qr_payloads(image), [payload])
+
     def test_windows_fallback_uses_one_ocr_read_without_layout_retries(self) -> None:
         image = Image.new("RGB", (720, 420), "white")
         with patch("backend.app.ocr._uses_windows_ocr_fallback", return_value=True), \
@@ -21,10 +39,19 @@ class OCRLatencyRegressionTests(unittest.TestCase):
     def test_complete_english_card_skips_recovery_only_for_missing_designation(self) -> None:
         image = Image.new("RGB", (900, 500), "white")
         with patch("backend.app.ocr._read_image_with_layout", return_value=(
-            "Acme Industries Pvt Ltd\nJane Doe\n+91 9876543210", {}
+            "Acme Industries Pvt Ltd\nJane Doe\n+91 9876543210\njane@acme.com\nwww.acme.com", {}
         )), patch("backend.app.ocr._read_recovery_crops") as recovery:
             _read_card_text(image)
         recovery.assert_not_called()
+
+    def test_found_name_and_phone_still_get_one_crop_for_missing_contact_details(self) -> None:
+        image = Image.new("RGB", (900, 500), "white")
+        with patch("backend.app.ocr._read_image_with_layout", return_value=(
+            "Acme Industries Pvt Ltd\nJane Doe\n+91 9876543210", {}
+        )), patch("backend.app.ocr._read_recovery_crops", return_value=["jane@acme.com\nwww.acme.com"]) as recovery:
+            text, _ = _read_card_text(image)
+        recovery.assert_called_once_with(image, contact_details=True)
+        self.assertIn("jane@acme.com", text)
 
 
 class CombinedCardImageTests(unittest.TestCase):
@@ -47,6 +74,29 @@ class CombinedCardImageTests(unittest.TestCase):
 
 
 class LeadFieldParsingTests(unittest.TestCase):
+    def test_each_populated_field_has_a_source_line_or_qr_payload(self) -> None:
+        result = _merge_qr_fields({
+            "company_name": "Acme Systems Pvt Ltd",
+            "contact_numbers": ["+91 9876543210"],
+            "email_addresses": ["jane@acme.com"],
+            "website": "www.acme.com",
+            "original_ocr_text": "Acme Systems Pvt Ltd\nMobile: +91 9876543210\njane@acme.com\nwww.acme.com",
+            "qr_data": [{"source_text": "BEGIN:VCARD\\nFN:Jane Doe", "contacts": ["+91 9876543210"], "emails": [], "urls": []}],
+        }, [])
+        sources = result["field_sources"]
+        self.assertEqual(sources["company_name"]["source_text"], "Acme Systems Pvt Ltd")
+        self.assertEqual(sources["contact_numbers"]["source_type"], "QR")
+        self.assertIn("BEGIN:VCARD", sources["contact_numbers"]["source_text"])
+        self.assertEqual(sources["email_addresses"]["source_text"], "jane@acme.com")
+
+    def test_translation_focus_transliterates_names_and_addresses_but_keeps_service_copy(self) -> None:
+        from backend.app.ocr import _translation_focus_text
+        source = "श्री अमित पाटील\nपुणे महाराष्ट्र 411001\nसर्व प्रकारची लाईट फिटिंग व मेंटेनन्सची कामे"
+        focused = _translation_focus_text(source)
+        self.assertNotRegex(focused.replace("सर्व प्रकारची लाईट फिटिंग व मेंटेनन्सची कामे", ""), r"[\u0900-\u097f]")
+        self.assertIn("shrii", focused.lower())
+        self.assertIn("सर्व प्रकारची लाईट फिटिंग व मेंटेनन्सची कामे", focused)
+
     def test_sample_barbowws_cta_does_not_become_owner_or_designation(self) -> None:
         fields = _parse_fields(
             "SALON PARTNERS\nJoin as a Partner\nkapil@barbowws.com\n"
@@ -57,6 +107,77 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertEqual(fields["company_name"], "Barbowws")
         self.assertIsNone(fields["owner_name"])
         self.assertIsNone(fields["designation"])
+
+    def test_app_download_qr_ocr_fragments_do_not_become_owner_name(self) -> None:
+        fields = _parse_fields("SALON PARTNERS\nDownload the App\nJoin as a Partner\nwww.barbowws.com")
+        self.assertIsNone(fields["owner_name"])
+
+    def test_ambiguous_uppercase_and_lowercase_ocr_fragments_stay_blank_as_owner(self) -> None:
+        for fragment in ("ALARM IGE MAI", "tele ss"):
+            with self.subTest(fragment=fragment):
+                self.assertIsNone(_parse_fields(f"Company Services\n{fragment}") ["owner_name"])
+
+    def test_ocr_contact_number_leaking_into_owner_is_left_blank_and_flagged(self) -> None:
+        from backend.app.ocr import _fields_from_ocr_text
+        source = "Company Services\nJohn Doe call 9876543210"
+        with patch("backend.app.ocr._parse_fields", return_value={"company_name": "Company Services", "owner_name": "John Doe 9876543210", "raw_text": source}), \
+             patch("backend.app.ocr.translate_document_text", return_value=(source, "not_needed")):
+            fields = _fields_from_ocr_text(source)
+        self.assertIsNone(fields["owner_name"])
+        self.assertIn("Owner Name", " ".join(fields["review_warnings"]))
+        self.assertEqual(fields["original_ocr_text"], source)
+
+    def test_company_brand_is_cleaned_of_leading_ocr_symbols(self) -> None:
+        fields = _parse_fields("> 7 \\s SM Electricals\nShubham Mande\n9158578322")
+        self.assertEqual(fields["company_name"], "SM Electricals")
+
+    def test_non_mobile_ocr_number_is_not_saved_as_an_indian_contact(self) -> None:
+        fields = _parse_fields("SM Electricals\nShubham Mande\n9158578322\n3940400322")
+        self.assertEqual(fields["contact_numbers"], ["9158578322"])
+
+    def test_social_domains_are_mapped_to_social_fields_not_website(self) -> None:
+        fields = _parse_fields("Acme Services\nhttps://facebook.com/acme\nhttps://instagram.com/acme\nwww.acme.com")
+        self.assertEqual(fields["website"], "www.acme.com")
+        self.assertEqual(fields["facebook_link"], "https://facebook.com/acme")
+        self.assertEqual(fields["instagram_link"], "https://instagram.com/acme")
+
+    def test_labeled_business_description_is_kept_separate_from_address_and_raw_text(self) -> None:
+        fields = _parse_fields("Company Name: Acme Electricals\nDescription: Lighting installation and maintenance\nAddress: Pune")
+        self.assertEqual(fields["business_description"], "Lighting installation and maintenance")
+        self.assertEqual(fields["company_address"], "Pune")
+
+    def test_clear_service_statement_is_mapped_to_business_description(self) -> None:
+        fields = _parse_fields("SM Electricals\nShubham Mande\nAll types of lighting fitting and maintenance work")
+        self.assertEqual(fields["business_description"], "All types of lighting fitting and maintenance work")
+
+    def test_card_service_lines_map_to_description_without_becoming_address(self) -> None:
+        fields = _parse_fields(
+            "Morya Refrigeration\nWe have a freezer, deep freezer and visible cooler\n"
+            "Near City Hospital, Pune 413102"
+        )
+        self.assertEqual(fields["business_description"], "We have a freezer, deep freezer and visible cooler")
+        self.assertEqual(fields["company_address"], "Near City Hospital, Pune 413102")
+
+    def test_marathi_and_hindi_service_terms_get_english_descriptions(self) -> None:
+        electrical = _parse_fields("SM Electricals\nआमच्याकडे सर्व प्रकारची लाईट फिटींगची व मेंटेनन्सूची कामे")
+        refrigeration = _parse_fields("आमच्याकडे फ्रीज, डिप फ्रीज, विसीबल कुलर, एसी, व्हीआरव्ही कामे")
+        fashion = _parse_fields("सभी प्रकार डिजाइनर सलवार ब्लाउज सिलाई कार्य होते हैं")
+        self.assertEqual(electrical["business_description"], "Lighting fitting and maintenance services")
+        self.assertEqual(refrigeration["business_description"], "Refrigeration, freezer, cooler and air-conditioning services")
+        self.assertEqual(fashion["business_description"], "Designer clothing, blouse and tailoring services")
+
+    def test_indic_proprietor_prefix_is_separated_from_the_person_name(self) -> None:
+        fields = _parse_fields("प्रो.प्रा.तेनम काळे ine मो.9373 51 2003")
+        self.assertEqual(fields["owner_name"], "तेनम काळे")
+        self.assertEqual(fields["designation"], "Proprietor")
+        self.assertEqual(fields["contact_numbers"], ["9373 51 2003"])
+
+    def test_conflicting_indic_owner_reads_are_left_blank_for_review(self) -> None:
+        fields = _parse_fields(
+            "प्रो.प्रा.तेनम काळे मो.9373 51 2003\nओो,प्रा.तेजम काळे AIO ime 1.9373 51 200"
+        )
+        self.assertIsNone(fields["owner_name"])
+        self.assertEqual(fields["designation"], "Proprietor")
 
     def test_recovery_ocr_adds_missed_card_lines_without_dropping_primary_data(self) -> None:
         primary = "SALON PARTNERS\nJoin as a Partner\nkapil@barbowws.com\nwww.barbowws.com"
@@ -284,6 +405,10 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertEqual(fields["whatsapp_link"], "https://wa.me/919876543210")
         self.assertEqual(fields["pincode"], "411001")
 
+    def test_short_ocr_suffix_is_not_added_to_an_indian_mobile_number(self) -> None:
+        fields = _parse_fields("Amit Nalawade\nMarketing Executive\n+91 86558 73467 7-8")
+        self.assertEqual(fields["contact_numbers"], ["+91 86558 73467"])
+
     def test_company_line_wins_over_authorised_product_brand_and_pipe_layout(self) -> None:
         fields = _parse_fields(
             "GAWADE\nGREEN POWER\nDeepak Shivaji Gawade\nManaging Director\n"
@@ -315,6 +440,15 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertEqual(fields["designation"], "Managing Director")
         self.assertEqual(fields["contact_numbers"], ["+91-9922512000"])
         self.assertIn("Laxmi Complex", fields["company_address"])
+
+    def test_lucky_marine_legal_suffix_is_kept_when_ocr_reads_it(self) -> None:
+        fields = _parse_fields("LUCKY MARINE SHIPPING & LOGISTICS PVT. LTD.\nHrishikesh Mhatre\nDirector")
+        self.assertEqual(fields["company_name"], "LUCKY MARINE SHIPPING & LOGISTICS PVT. LTD.")
+
+    def test_truncated_company_ocr_warns_instead_of_claiming_a_complete_registered_name(self) -> None:
+        from backend.app.ocr import _fields_from_ocr_text
+        fields = _fields_from_ocr_text("LUCKY MARINE SHIPPING & LOGIS'\nwww.luckymarineshipping.com")
+        self.assertTrue(any("truncated the company line" in warning for warning in fields["review_warnings"]))
 
     def test_business_cards_extract_non_latin_owner_and_title_as_latin_text(self) -> None:
         from backend.app.ocr import _fields_from_ocr_text

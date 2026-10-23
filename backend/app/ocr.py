@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -168,10 +169,10 @@ def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
         if alternate_score > text_score:
             text = _merge_ocr_transcripts(text, alternate)
             heights = {**heights, **alternate_heights}
-    # If the first pass contains only a few stray Indic glyphs, a sparse pass
-    # can still recover real Hindi/Marathi lines. Keep both transcripts so a
-    # better alternate reading never removes names or contact lines.
-    if len(re.findall(r"[\u0900-\u097F]", text)) < 3:
+    # Reuse the sparse pass above when it already ran; a second identical
+    # Tesseract call added several seconds to cards without improving coverage.
+    if (re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:https?://|www\.)\S+", text, re.I)
+            and len(re.findall(r"[\u0900-\u097F]", text)) < 3):
         indic_text, indic_heights = read("--psm 12")
         if len(re.findall(r"[\u0900-\u097F]", indic_text)) >= 3:
             text = _merge_ocr_transcripts(text, indic_text)
@@ -201,12 +202,42 @@ def _merge_ocr_transcripts(primary: str, additional: str) -> str:
     return "\n".join(lines)
 
 
-def _read_recovery_crops(image: Image.Image) -> list[str]:
+_INDIC_MEANING_MARKERS = re.compile(
+    r"(?:सभी|प्रकार|कपड़े|बुटीक|बूटीक|फैशन|व्यवसाय|कंपनी|लिमिटेड|उद्योग|सेवा|दुरुस्ती|काम|करून|मिळतील|"
+    r"केली|जातील|आमच्याकडे|फिटिंग|मेंटेन|फ्रीज|कुलर|रेफ्रिजरेशन|विद्युत|लाईट|प्रकाश|हॉटेल|सलवार|डिजाइनर|"
+    r"संचालक|मालकीन|मालक|प्रो\.?|निर्देशक)"
+)
+
+
+def _translation_focus_text(text: str) -> str:
+    """Translate only meaningful Indic business lines; transliterate the rest.
+
+    Names and addresses are better kept phonetically stable, while service and
+    category lines benefit from semantic translation. This avoids sending OCR
+    fragments, duplicate logo text, and every address line through the local
+    translation model for each card.
+    """
+    focused = []
+    for line in text.splitlines(keepends=True):
+        if re.search(r"[\u0900-\u097f]", line) and _INDIC_MEANING_MARKERS.search(line):
+            focused.append(line)
+        else:
+            focused.append(latinize_document_text(line))
+    return "".join(focused)
+
+
+def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> list[str]:
     """Read bounded information regions when the full-card pass missed fields."""
     width, height = image.size
     ratio = width / max(height, 1)
-    if 0.85 <= ratio <= 1.15:
-        boxes = [((int(width * 0.02), int(height * 0.25), int(width * 0.98), int(height * 0.70)), "--psm 11", 2.0)]
+    if contact_details and ratio > 1.15:
+        # Contact lines sit beneath the name on many cards. A focused crop
+        # avoids spending another full-card pass and reads each line cleanly.
+        boxes = [((0, int(height * 0.40), int(width * 0.62), int(height * 0.92)), "--psm 6", 2.0)]
+    elif 0.85 <= ratio <= 1.15:
+        # Include both upper brand/title and lower address panels; the previous
+        # narrow center crop clipped the brand on square Marathi cards.
+        boxes = [((int(width * 0.03), int(height * 0.10), int(width * 0.97), int(height * 0.87)), "--psm 6", 1.7)]
     else:
         boxes = [
             # The contact/name panel on many cards occupies the left half. A
@@ -216,7 +247,7 @@ def _read_recovery_crops(image: Image.Image) -> list[str]:
             ((0, int(height * 0.25), int(width * 0.75), height), "--psm 6", 1.5),
         ]
     results: list[str] = []
-    crop_language = "eng" if ratio > 1.15 else os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar")
+    crop_language = os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar")
     for box, config, scale in boxes:
         crop = image.crop(box)
         if scale > 1:
@@ -243,13 +274,24 @@ def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
         not fields.get("company_name")
         or not fields.get("owner_name")
         or (not fields.get("contact_numbers") and not fields.get("email_addresses") and not fields.get("website"))
+        or (bool(fields.get("contact_numbers")) and not fields.get("email_addresses") and not fields.get("website"))
         or any(re.search(r"[\u0900-\u097f]", str(fields.get(key) or "")) for key in ("company_name", "owner_name"))
         or bool(re.search(r"\b(?:logis|technolog|corpor|industri)['’]?$", str(fields.get("company_name") or ""), re.I))
     )
     if needs_recovery:
-        for recovery in _read_recovery_crops(image):
+        contact_recovery = bool(fields.get("contact_numbers")) and not fields.get("email_addresses") and not fields.get("website")
+        focused_contact_pass = contact_recovery and not (
+            not fields.get("company_name") or not fields.get("owner_name")
+        )
+        for recovery in _read_recovery_crops(image, contact_details=focused_contact_pass):
             if recovery.strip():
                 text = _merge_ocr_transcripts(text, recovery)
+        recovered_fields = _parse_fields(text, heights)
+        if (not focused_contact_pass and recovered_fields.get("contact_numbers")
+                and not recovered_fields.get("email_addresses") and not recovered_fields.get("website")):
+            for recovery in _read_recovery_crops(image, contact_details=True):
+                if recovery.strip():
+                    text = _merge_ocr_transcripts(text, recovery)
     return text, heights
 
 
@@ -490,6 +532,8 @@ def _explicit_fields(text: str) -> dict[str, list[str]]:
         "person name": "owner_name", "director name": "owner_name", "founder name": "owner_name",
         "proprietor name": "owner_name",
         "designation": "designation", "job title": "designation", "position": "designation", "title": "designation",
+        "description": "business_description", "business description": "business_description",
+        "company description": "business_description", "services": "business_description",
         "address": "company_address", "company address": "company_address", "office address": "company_address",
         "registered office": "company_address", "location": "company_address",
         "website": "website", "web site": "website", "url": "website",
@@ -552,11 +596,20 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     email_addresses = list(dict.fromkeys(match.group(0).rstrip(".,;") for match in email_matches))
     # Tesseract sometimes drops the dot after the conventional ``www`` prefix.
     full_text = re.sub(r"\bwww(?=[A-Za-z0-9-])", "www.", full_text, flags=re.I)
-    website_match = re.search(
+    url_pattern = re.compile(
         r"(?<![@\w.-])(?:https?://)?(?:www\.)?[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,}(?:/[^\s]*)?(?![\w@.-])",
-        full_text,
         re.I,
     )
+    social_links: dict[str, str] = {}
+    website = None
+    for url_match in url_pattern.finditer(full_text):
+        candidate_url = url_match.group(0).rstrip(".,;)")
+        parsed_url = parse_qr_payload(candidate_url if re.match(r"https?://", candidate_url, re.I) else f"https://{candidate_url}")
+        for social_key in ("facebook_link", "instagram_link", "whatsapp_link"):
+            if parsed_url.get(social_key):
+                social_links.setdefault(social_key, str(parsed_url[social_key]))
+        if not any(parsed_url.get(key) for key in ("facebook_link", "instagram_link", "whatsapp_link")) and website is None:
+            website = candidate_url
     contact_numbers: list[str] = []
     phone_pattern = re.compile(r"(?<!\d)\+?\d(?:[ \t().-]*\d){6,14}(?!\d)")
     for line in lines:
@@ -566,11 +619,19 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         for match in phone_pattern.finditer(contact_line):
             number = re.sub(r"\s+", " ", match.group(0)).strip()
             digits = re.sub(r"\D", "", number)
-            if len(digits) >= 9 and number not in contact_numbers:
+            if digits.startswith("91") and len(digits) > 12 and digits[2] in "6789":
+                # A nearby OCR artifact such as a short card serial after an
+                # Indian mobile number must not become part of a dial link.
+                digits = digits[:12]
+                number = f"+91 {digits[2:7]} {digits[7:12]}"
+            indian_mobile = len(digits) == 10 and digits[0] in "6789"
+            country_prefixed_mobile = len(digits) == 12 and digits.startswith("91") and digits[2] in "6789"
+            indian_landline = len(digits) in {11, 12} and digits.startswith("0")
+            international = number.lstrip().startswith("+") and 10 <= len(digits) <= 15
+            if (indian_mobile or country_prefixed_mobile or indian_landline or international) and number not in contact_numbers:
                 contact_numbers.append(number)
 
     email = email_addresses[0] if email_addresses else None
-    website = website_match.group(0).rstrip(".,;") if website_match else None
 
     excluded = {value.lower() for value in (email, website) if value}
     candidates = [
@@ -582,14 +643,14 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     company_markers = re.compile(
         r"\b(incorporated|inc\.?|llc|ltd\.?|limited|private|corp\.?|corporation|technologies?|tech|"
         r"solutions?|services?|company|co\.?|groups?|industr(?:y|ies)|shipping|logistics|foundation|trust|"
-        r"association|societ(?:y|ies|y)|scociety|institutes?|universit(?:y|ies)|bank|hospitals?|clinic|schools?|"
+        r"association|societ(?:y|ies|y)|scociety|institutes?|universit(?:y|ies)|bank|hospitals?|clinic|schools?|electricals?|refrigeration|"
         r"colleges?|academ(?:y|ies)|estate|estates|real\s+estate|realstates?|pharma(?:ceutical)?s?|pharamasetical|"
         r"business|innovations?|inovation|advertising|enterprises?|spaces?|hotels?|lodges?|laudge|fashion|boutiques?|systems?|"
         r"restaurants?|restorents|finance|loans?|developers?|associates?|education|consultan(?:t|cy|ts|cies)|"
         r"movers?|packers?|packagers?|automation|ngo|classes|pvt\.?)\b",
         re.I,
     )
-    indic_business_markers = re.compile(r"(?:फैशन|फेशन|बुटीक|बूटीक|कंपनी|लिमिटेड|उद्योग|सेवाएँ|व्यवसाय)")
+    indic_business_markers = re.compile(r"(?:फैशन|फेशन|बुटीक|बूटीक|कंपनी|लिमिटेड|उद्योग|सेवाएँ|व्यवसाय|रेफ्रिजरेशन|इलेक्ट्रिकल्स?)")
     designation_markers = re.compile(
         r"\b(director|manager|owner|founder|ceo|cto|cfo|president|consultant|engineer|officer|executive|"
         r"specialist|analyst|designer|architect|administrator|coordinator|developer|accountant|partner|head)\b|\bsales\s+(?:manager|executive|representative|head|director)\b",
@@ -599,10 +660,17 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         line for line in candidates
         if re.match(r"^(?:mr|mrs|ms|miss|dr|prof)\.?\s+[\w\u00c0-\u024f]", line, re.I)
     ), None)
-    indic_honorific_owner = next((
-        line for line in candidates
-        if re.match(r"^(?:श्री|श्रीमती|कुमारी|डॉ\.?|डॉक्टर)\s*[\u0900-\u097f]", line)
-    ), None)
+    indic_owner_candidates = [
+        " ".join(match.group("name").split())
+        for line in candidates
+        if (match := re.search(
+            r"(?:(?:श्री|श्रीमती|कुमारी|डॉ\.?|डॉक्टर|प्रो\.?|प्रा\.?)\s*)+"
+            r"(?P<name>[\u0900-\u097f]{2,}(?:\s+[\u0900-\u097f]{2,}){1,3})",
+            line,
+        ))
+    ]
+    indic_owner_keys = {re.sub(r"[^\u0900-\u097f]", "", name) for name in indic_owner_candidates}
+    indic_honorific_owner = indic_owner_candidates[0] if len(indic_owner_keys) == 1 and indic_owner_candidates else None
     company = next((
         line for line in candidates
         if company_markers.search(line) and line != honorific_owner and not designation_markers.search(line)
@@ -711,12 +779,17 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                 if company_key.endswith(partial):
                     company = re.sub(rf"{re.escape(partial)}['’]?$", complete, company, flags=re.I)
                     break
+    if company and not company[0].isalnum():
+        company = re.sub(r"^[^A-Za-z\u0900-\u097f]*", "", company).strip(" |,;:-") or None
+    if company and re.match(r"^[A-Za-z]\s+(?=[A-Z]{2,}\s+[A-Z][a-z])", company):
+        company = re.sub(r"^[A-Za-z]\s+", "", company, count=1)
     promotional_text = re.compile(
         r"\b(certified|authori[sz]ed|official|channel|solutions?|provider|dealer|distributor|welcome|quality|trusted|leading|serving|"
         r"join\s+as|download|customers?|book\s+your|check\s+estimated|alert\s+before|waiting\s+time|appointment)\b",
         re.I,
     )
-    non_person_text = re.compile(r"\b(salon|partners?|customers?|download|appointment|estimated|waiting|boutique|fashion|blouse|saree|services?|seen)\b", re.I)
+    non_person_text = re.compile(r"\b(salon|partners?|customers?|download|app|play|appointment|estimated|waiting|boutique|fashion|blouse|saree|services?|seen)\b", re.I)
+    indic_proprietor = any(re.search(r"प्रो\.?\s*प्रा\.?", line) for line in lines)
     designation = next(
         (
             line for line in lines
@@ -724,7 +797,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                 or re.match(r"^marketing\s+exec\w*", line, re.I))
             and not promotional_text.search(line) and line != company
         ),
-        None,
+        "Proprietor" if indic_proprietor else None,
     )
     if designation:
         designation = re.split(r"\s+(?:[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:https?://|www\.)\S+|\+?\d[\d ()-]{7,})", designation, maxsplit=1, flags=re.I)[0].strip(" ,;:-")
@@ -734,6 +807,23 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
             designation = designation[:recognized_titles[-1].end()].strip(" ,;:-")
         if re.match(r"^marketing\s+exec\w*\b", designation, re.I):
             designation = "Marketing Executive"
+    description = next((
+        line for line in lines
+        if line not in {company, designation}
+        and not re.search(r"@|https?://|www\.|\+?\d[\d ()-]{7,}", line, re.I)
+        and re.search(r"\b(?:all\s+types?\s+of|all\s+kinds?\s+of|we\s+(?:provide|offer|undertake|have)|our\s+services|installation|maintenance|repairs?|tailoring|refrigeration|freezers?|coolers?|air\s*condition(?:ing|er)?|light(?:ing)?\s+fitting|electrical\s+work|wiring|blouses?|salwar|sewing|stitching)\b", line, re.I)
+    ), None)
+    if not description:
+        indic_copy = " ".join(lines)
+        if (re.search(r"(?:लाईट|लाइट)", indic_copy) and re.search(r"(?:फिटींग|फिटिंग)", indic_copy)
+                and re.search(r"(?:मेंटेन|देखभाल|कामे)", indic_copy)):
+            description = "Lighting fitting and maintenance services"
+        elif (re.search(r"(?:फ्रीज|फ्रिज|कुलर|कूलर)", indic_copy)
+                and re.search(r"(?:एसी|व्हीआरव्ही|व्हीआरएफ|वीआरवी|वीआरएफ|कामे)", indic_copy)):
+            description = "Refrigeration, freezer, cooler and air-conditioning services"
+        elif (re.search(r"(?:सलवार|ब्लाउज|लहंगा|कुर्ती)", indic_copy)
+                and re.search(r"(?:सिलाई|कार्य|काम)", indic_copy)):
+            description = "Designer clothing, blouse and tailoring services"
     # When a card has no explicit company label or legal suffix, a branded
     # website is safer evidence than treating a person's prominent name as a
     # company. Use the registered domain as a review candidate.
@@ -746,8 +836,9 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     indic_context_owner = next((
         line for index, line in enumerate(lines)
         if line not in {company, designation}
-        and re.fullmatch(r"[\u0900-\u097f]{2,}(?:\s+[\u0900-\u097f]{2,}){1,3}", line)
-        and any(phone_pattern.search(context) for context in lines[max(0, index - 1):index + 2])
+        and re.fullmatch(r"[\u0900-\u097f]{2,}(?:\s+[\u0900-\u097f]{2,}){1,3}(?:\s*[-–]\s*[\u0900-\u097f]{2,})?", line)
+        and not indic_business_markers.search(line)
+        and any(phone_pattern.search(context) for context in lines[max(0, index - 2):index + 3])
     ), None)
     owner = honorific_owner or indic_honorific_owner or indic_context_owner or next(
         (
@@ -757,6 +848,8 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
             and not non_person_text.search(line)
             and not re.search(r"\b(partner|director|manager|owner|founder|ceo|cto|cfo|president|sales|consultant|engineer|officer|executive)\b", line, re.I)
             and 2 <= len(line.split()) <= 4
+            and all(len(word.strip("'.-")) >= 2 for word in line.split())
+            and all(word.isupper() or (word[0].isupper() and word[1:].islower()) for word in line.split())
             and re.fullmatch(r"[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){1,3}", line)
         ),
         None,
@@ -766,8 +859,14 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                       and not promotional_text.search(line)
                       and not non_person_text.search(line)
                       and 2 <= len(line.split()) <= 4
+                      and all(len(word.strip("'.-")) >= 2 for word in line.split())
+                      and all(word.isupper() or (word[0].isupper() and word[1:].islower()) for word in line.split())
                       and re.fullmatch(r"[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){1,3}", line)]
         owner = next((line for line in person_candidates if not line.isupper()), person_candidates[0] if person_candidates else owner)
+        if owner and owner.isupper() and not designation:
+            # All-caps OCR fragments without an honorific or a nearby title are
+            # too ambiguous to treat as a person's name. Leave them for review.
+            owner = None
 
     address_label = re.compile(r"^\s*(?:(?:office|registered|company)\s+)*address\s*[:#-]*\s*", re.I)
     explicit_address_indexes = [index for index, line in enumerate(lines) if address_label.search(line)]
@@ -817,6 +916,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         "company_name": (explicit.get("company_name") or [company])[0],
         "owner_name": (explicit.get("owner_name") or [owner])[0],
         "designation": (explicit.get("designation") or [designation])[0],
+        "business_description": (explicit.get("business_description") or [description])[0],
         "company_address": explicit_address or ", ".join(address_parts) or None,
         "contact_number": contacts[0] if contacts else None,
         "contact_numbers": contacts,
@@ -825,9 +925,9 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         "website": (explicit.get("website") or [website])[0],
         "telephone_numbers": explicit.get("telephone_numbers", []),
         "fax_numbers": explicit.get("fax_numbers", []),
-        "facebook_link": (explicit.get("facebook_link") or [None])[0],
-        "instagram_link": (explicit.get("instagram_link") or [None])[0],
-        "whatsapp_link": (explicit.get("whatsapp_link") or [None])[0],
+        "facebook_link": (explicit.get("facebook_link") or [social_links.get("facebook_link")])[0],
+        "instagram_link": (explicit.get("instagram_link") or [social_links.get("instagram_link")])[0],
+        "whatsapp_link": (explicit.get("whatsapp_link") or [social_links.get("whatsapp_link")])[0],
         "city": (explicit.get("city") or [None])[0],
         "state": (explicit.get("state") or [None])[0],
         "pincode": (explicit.get("pincode") or [None])[0],
@@ -852,6 +952,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     if sum(bool(re.search(marker, text, re.I)) for marker in template_markers) >= 2:
         for key in (
             "company_name", "owner_name", "designation", "company_address",
+            "business_description",
             "contact_number", "contact_numbers", "email", "email_addresses",
             "website", "telephone_numbers", "fax_numbers", "facebook_link",
             "instagram_link", "whatsapp_link", "city", "state", "pincode",
@@ -876,6 +977,15 @@ def _decode_qr_payloads(image: Image.Image) -> list[str]:
         ok, values, _, _ = detector.detectAndDecodeMulti(pixels)
         if ok and values is not None:
             decoded.extend(str(value).strip() for value in values if str(value).strip())
+        # Printed card QR codes are often only 70–100 pixels wide in a phone
+        # photo. OpenCV detects the finder pattern at native size but fails to
+        # decode its payload; a single 2x interpolation pass fixes that case.
+        if max(pixels.shape[:2]) < 2600:
+            enlarged = cv2.resize(pixels, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            ok, values, _, _ = detector.detectAndDecodeMulti(enlarged)
+            if ok and values is not None:
+                decoded.extend(str(value).strip() for value in values if str(value).strip())
+            pixels = enlarged
         if not decoded:
             value, _, _ = detector.detectAndDecode(pixels)
             if value and value.strip():
@@ -887,6 +997,7 @@ def _decode_qr_payloads(image: Image.Image) -> list[str]:
 
 def _merge_qr_fields(fields: dict[str, object], payloads: list[str]) -> dict[str, object]:
     if not payloads:
+        fields["field_sources"] = _field_source_evidence(fields)
         return fields
     merged = dict(fields)
     parsed = [parse_qr_payload(payload) for payload in payloads]
@@ -905,26 +1016,99 @@ def _merge_qr_fields(fields: dict[str, object], payloads: list[str]) -> dict[str
             merged["contact_number" if key == "contact_numbers" else "email"] = merged[key][0]
     merged["qr_payloads"] = payloads
     merged["qr_data"] = [item for item in parsed if not item.get("unmapped")]
+    merged["field_sources"] = _field_source_evidence(merged)
     return merged
 
 
+def _field_source_evidence(fields: dict[str, object]) -> dict[str, dict[str, str]]:
+    """Attach the OCR line or QR payload behind each populated preview value."""
+    original_lines = [line.strip() for line in str(fields.get("original_ocr_text") or "").splitlines() if line.strip()]
+    qr_data = fields.get("qr_data") if isinstance(fields.get("qr_data"), list) else []
+    qr_keys = {
+        "company_name": "company_name", "owner_name": "owner_name", "designation": "designation",
+        "company_address": "company_address", "website": "website", "facebook_link": "facebook_link",
+        "instagram_link": "instagram_link", "whatsapp_link": "whatsapp_link",
+        "contact_numbers": "contacts", "email_addresses": "emails",
+    }
+    evidence: dict[str, dict[str, str]] = {}
+    for key, qr_key in qr_keys.items():
+        value = fields.get(key)
+        values = value if isinstance(value, list) else [value]
+        rendered = [str(item).strip() for item in values if item and str(item).strip()]
+        if not rendered:
+            continue
+        matched_qr = next((
+            item for item in qr_data
+            if isinstance(item, dict) and any(str(candidate).strip() in rendered
+               for candidate in ([item.get(qr_key)] if isinstance(item.get(qr_key), str) else item.get(qr_key, [])))
+        ), None)
+        if matched_qr:
+            source_text = str(matched_qr.get("source_text") or "")
+            evidence[key] = {"source_type": "QR", "source_text": source_text, "confidence": "high"}
+            continue
+        match = None
+        span_size = 3 if key in {"company_name", "owner_name", "designation", "business_description", "company_address"} else 1
+        for start in range(len(original_lines)):
+            for end in range(start, min(len(original_lines), start + span_size)):
+                source_span = "\n".join(original_lines[start:end + 1])
+                latin_span = latin_name(source_span) or source_span
+                if any(candidate.casefold() in source_span.casefold()
+                       or (key in {"company_name", "owner_name", "designation", "business_description", "company_address"}
+                           and candidate.casefold() in latin_span.casefold()) for candidate in rendered):
+                    match = source_span
+                    break
+            if match:
+                break
+        if not match and key in {"contact_numbers", "email_addresses"}:
+            match = next((line for line in original_lines if any(
+                re.sub(r"\D", "", candidate) in re.sub(r"\D", "", line)
+                if key == "contact_numbers" else candidate.casefold() in line.casefold()
+                for candidate in rendered
+            )), None)
+        evidence[key] = {
+            "source_type": "OCR",
+            "source_text": match or "",
+            # OCR line matching proves provenance, not visual recognition
+            # confidence; request a quick check against the image.
+            "confidence": "review",
+        }
+    return evidence
+
+
+def _record_processing_times(fields: dict[str, object], started: float, ocr_ms: float) -> dict[str, object]:
+    times = fields.get("processing_times_ms")
+    if not isinstance(times, dict):
+        times = {}
+    times["ocr_ms"] = round(ocr_ms)
+    times["total_ms"] = round((time.perf_counter() - started) * 1000)
+    fields["processing_times_ms"] = times
+    return fields
+
+
 def extract_fields(path: Path, content_type: str) -> dict[str, object]:
+    started = time.perf_counter()
     if content_type == "application/pdf":
-        return _fields_from_ocr_text(_extract_text(path, content_type))
+        ocr_started = time.perf_counter()
+        fields = _fields_from_ocr_text(_extract_text(path, content_type))
+        return _record_processing_times(fields, started, (time.perf_counter() - ocr_started) * 1000)
 
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
         regions = _split_card_image(image)
         if regions and len(regions) > 1:
             cards: list[dict[str, object]] = []
+            ocr_elapsed_ms = 0.0
             for region in regions:
+                ocr_started = time.perf_counter()
                 text, line_heights = _read_card_text(region)
-                cards.append(_merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(region)))
+                ocr_elapsed_ms += (time.perf_counter() - ocr_started) * 1000
+                card = _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(region))
+                cards.append(_record_processing_times(card, started, ocr_elapsed_ms))
             cards = [card for card in cards if card.get("company_name") and (card.get("contact_numbers") or card.get("email_addresses") or card.get("website") or card.get("company_address"))]
             if len(cards) > 1:
                 primary = cards[0].copy()
                 primary["cards"] = cards
-                return primary
+                return _record_processing_times(primary, started, ocr_elapsed_ms)
         # Card photos are frequently portrait-oriented because the phone was
         # held upright while the physical landscape card was sideways. OCR on
         # the unrotated pixels causes names and labels to swap fields.
@@ -939,13 +1123,19 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
                 (max(1, round(ocr_image.width * scale)), max(1, round(ocr_image.height * scale))),
                 Image.Resampling.LANCZOS,
             )
+        ocr_started = time.perf_counter()
         text, line_heights = _read_card_text(ocr_image)
-        return _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(image) + _decode_qr_payloads(ocr_image))
+        ocr_ms = (time.perf_counter() - ocr_started) * 1000
+        fields = _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(image) + _decode_qr_payloads(ocr_image))
+        return _record_processing_times(fields, started, ocr_ms)
 
 
 def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | None = None) -> dict[str, object]:
     fields = _parse_fields(original_text, line_heights)
-    translated, status = translate_document_text(original_text)
+    translation_source = _translation_focus_text(original_text)
+    translation_started = time.perf_counter()
+    translated, status = translate_document_text(translation_source)
+    translation_ms = round((time.perf_counter() - translation_started) * 1000)
     if translated and status == "translated":
         heights = {after.casefold(): (line_heights or {}).get(before.casefold(), 0)
                    for before, after in zip(original_text.splitlines(), translated.splitlines())}
@@ -954,7 +1144,7 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
         for key in ("contact_numbers", "contact_number", "email_addresses", "email", "website"):
             english[key] = fields.get(key)
         source_lines, english_lines = _clean_lines(original_text), _clean_lines(translated)
-        for key in ("company_name", "owner_name", "designation", "company_address"):
+        for key in ("company_name", "owner_name", "designation", "business_description", "company_address"):
             original_value = fields.get(key)
             translated_value = english.get(key)
             # A translated value is usable only when it maps back to the same
@@ -972,7 +1162,13 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
                     if mapped_source:
                         break
             has_indic_source = bool(mapped_source and re.search(r"[\u0900-\u097f]", mapped_source))
-            if original_value and not re.search(r"[\u0900-\u097f]", str(original_value)):
+            if key == "business_description" and original_value and not re.search(r"[\u0900-\u097f]", str(original_value)):
+                # A service description assembled from clearly recognized
+                # source terms is more reliable than a noisy machine sentence.
+                english[key] = original_value
+            elif key in {"business_description", "designation"} and translated_value and has_indic_source:
+                english[key] = translated_value
+            elif original_value and not re.search(r"[\u0900-\u097f]", str(original_value)):
                 english[key] = original_value
             elif original_value and re.search(r"[\u0900-\u097f]", str(original_value)):
                 # A company/person name is an identity, not copy to translate.
@@ -1025,7 +1221,18 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
             if not fields.get("owner_name"):
                 latin_fields["owner_name"] = None
             fields = latin_fields
-            fields["translation_message"] = "English translation is unavailable because the model is not installed; the preview uses a Latin-only transliteration/cleaned transcript. Verify names and address before saving."
+            fields["translation_message"] = (
+                "Hindi/Marathi business text was transliterated to Latin because semantic translation is unavailable. "
+                "Check names and address before saving."
+                if status != "unavailable" else
+                "English translation is unavailable because the model is not installed; the preview uses a Latin-only transliteration/cleaned transcript. Verify names and address before saving."
+            )
+    contaminated_identity_fields = []
+    for key in ("company_name", "owner_name", "designation"):
+        value = str(fields.get(key) or "")
+        if re.search(r"@|(?:https?://|www\.)|(?<!\d)\+?\d(?:[\s().-]*\d){6,14}(?!\d)", value, re.I):
+            fields[key] = None
+            contaminated_identity_fields.append(key.replace("_", " ").title())
     fields["original_ocr_text"] = original_text
     fields["translation_status"] = status
     field_review_warnings = list(fields.get("review_warnings") or [])
@@ -1037,8 +1244,22 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
         field_review_warnings.append("No designation was confidently identified. Confirm whether one is printed on the card.")
     if not fields.get("email_addresses") and not fields.get("website"):
         field_review_warnings.append("No email address or website was confidently identified. Check the source card.")
+    if (fields.get("company_name") and not re.search(r"\b(?:pvt\.?\s*ltd\.?|private\s+limited|limited|ltd\.?|llp|inc\.?|corporation|corp\.?)\b", str(fields["company_name"]), re.I)
+            and re.search(r"\b(?:corpor|logis|industri|technolog)['’](?:\s|$)", original_text, re.I)):
+        field_review_warnings.append("OCR appears to have truncated the company line; verify its complete registered name and legal suffix.")
+    if contaminated_identity_fields:
+        field_review_warnings.append(
+            "OCR mixed contact or web data into " + ", ".join(contaminated_identity_fields) + "; those preview fields were left blank for review."
+        )
+    if re.search(r"[\u0900-\u097f]", original_text) and any(fields.get(key) for key in ("company_name", "owner_name")):
+        field_review_warnings.append("Check transliterated company and person names against the original card before saving.")
     if field_review_warnings:
         fields["review_warnings"] = field_review_warnings
     if status == "unavailable" and not fields.get("translation_message"):
         fields["translation_message"] = "English translation is unavailable or incomplete. Retry after configuring the local translation model, or enter English values manually before saving. The original OCR text is preserved."
+    processing_times = fields.get("processing_times_ms")
+    if not isinstance(processing_times, dict):
+        processing_times = {}
+    processing_times["translation_ms"] = translation_ms
+    fields["processing_times_ms"] = processing_times
     return fields

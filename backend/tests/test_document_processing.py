@@ -70,6 +70,30 @@ class DocumentReviewFlowTests(unittest.TestCase):
             sheet = load_workbook(BytesIO(exported.content))["Leads"]
             self.assertEqual(sheet["C2"].value, "Anmol")
 
+    def test_business_description_is_saved_updated_and_exported_separately(self) -> None:
+        from backend.app.schemas import LeadUpdate
+        with self.session_factory() as db:
+            lead = main.create_lead(LeadCreate(
+                company_name="SM Electricals",
+                business_description="Lighting installation and maintenance",
+                raw_text="Company Name: SM Electricals\nDescription: Lighting installation and maintenance",
+                source_review_confirmed=True,
+            ), db)
+            self.assertEqual(lead.business_description, "Lighting installation and maintenance")
+            updated = main.update_lead(lead.id, LeadUpdate(
+                business_description="Electrical repair and installation", source_review_confirmed=True,
+            ), db)
+            self.assertEqual(updated.business_description, "Electrical repair and installation")
+
+            class CapturedResponse:
+                def __init__(self, content, **kwargs): self.content = content.getvalue()
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                exported = main.export_leads(search=None, ids=[lead.id], company_name=None,
+                    owner_name=None, city=None, state=None, export_count=None, db=db)
+            sheet = load_workbook(BytesIO(exported.content))["Leads"]
+            description_column = [cell.value for cell in sheet[1]].index("Business description") + 1
+            self.assertEqual(sheet.cell(2, description_column).value, "Electrical repair and installation")
+
     def test_original_script_in_other_document_text_does_not_block_save(self) -> None:
         with self.session_factory() as db:
             saved = main.create_lead(

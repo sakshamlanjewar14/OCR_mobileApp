@@ -7,6 +7,7 @@ class LeadFields(BaseModel):
     company_name: str = Field(min_length=1, max_length=255)
     owner_name: str | None = Field(default=None, max_length=255)
     designation: str | None = Field(default=None, max_length=120)
+    business_description: str | None = None
     company_address: str | None = None
     contact_number: str | None = Field(default=None, max_length=80)
     email: str | None = Field(default=None, max_length=320)
@@ -32,6 +33,7 @@ class LeadUpdate(BaseModel):
     company_name: str | None = Field(default=None, min_length=1, max_length=255)
     owner_name: str | None = Field(default=None, max_length=255)
     designation: str | None = Field(default=None, max_length=120)
+    business_description: str | None = None
     company_address: str | None = None
     contact_number: str | None = Field(default=None, max_length=80)
     email: str | None = Field(default=None, max_length=320)

@@ -28,6 +28,12 @@ class QRParsingTests(unittest.TestCase):
         self.assertNotIn("website", parsed)
         self.assertEqual(parsed["location_coordinates"]["latitude"], 19.076)
 
+    def test_qr_redirect_service_is_preserved_without_becoming_company_website(self):
+        parsed = parse_qr_payload("https://api.singleqr.in/r/example")
+        self.assertNotIn("website", parsed)
+        self.assertEqual(parsed["qr_redirect_url"], "https://api.singleqr.in/r/example")
+        self.assertEqual(parsed["source_text"], "https://api.singleqr.in/r/example")
+
     def test_unsafe_and_unknown_payloads_are_not_opened_or_guessed(self):
         parsed = parse_qr_payload("javascript:alert(1)")
         self.assertTrue(parsed["unmapped"])

@@ -1,5 +1,5 @@
 const labels = {
-  company_name:['company','company name','full company name'], owner_name:['owner','owner name','contact person'], designation:['designation','job title'],
+  company_name:['company','company name','full company name'], owner_name:['owner','owner name','contact person'], designation:['designation','job title'], business_description:['description','business description','company description','services'],
   company_address:['address','company address','office address'], website:['website','web site'], facebook_link:['facebook','facebook link'],
   instagram_link:['instagram','instagram link'], whatsapp_link:['whatsapp link'], contact_numbers:['contact numbers','contact number','phone','phone number','mobile'],
   email_addresses:['email addresses','email address','email','email id'],

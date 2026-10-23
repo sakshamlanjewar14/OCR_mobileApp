@@ -92,6 +92,10 @@ def parse_qr_payload(payload: str) -> dict[str, object]:
                         fields["map_url"] = safe
                 else:
                     fields["map_url"] = safe
+            elif host == "singleqr.in" or host.endswith(".singleqr.in") or host in {"bit.ly", "tinyurl.com", "t.co", "qrco.de"}:
+                # Preserve third-party QR redirect URLs as source data without
+                # mislabeling them as the card owner's website.
+                fields["qr_redirect_url"] = safe
             else:
                 fields["website"] = safe
             result["urls"] = [safe]

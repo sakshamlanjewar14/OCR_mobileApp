@@ -49,7 +49,8 @@ function parseQrPayload(input) {
         const query=url.searchParams.get('q')||''; const qmatch=query.match(/^\s*([+-]?\d+(?:\.\d+)?),\s*([+-]?\d+(?:\.\d+)?)\s*$/);
         if(match||qmatch) { const m=match||qmatch; fields.location_coordinates={latitude:Number(m[1]),longitude:Number(m[2])}; }
         else fields.map_url=candidate;
-      } else add('website',candidate);
+      } else if(host==='singleqr.in'||host.endsWith('.singleqr.in')||['bit.ly','tinyurl.com','t.co','qrco.de'].includes(host)) fields.qr_redirect_url=candidate;
+      else add('website',candidate);
     } else if (!/^[a-z][a-z0-9+.-]*:/i.test(sourceText) && /@/.test(sourceText) && /\.[A-Za-z]{2,}/.test(sourceText)) addMany('email_addresses',sourceText);
   }
   for (const [key,value] of Object.entries(fields)) {

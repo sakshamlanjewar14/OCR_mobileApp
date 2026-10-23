@@ -67,6 +67,21 @@ def _load_model():
     return torch, tokenizer, model
 
 
+def warm_translation_model() -> None:
+    """Load a configured local translation model in the background at startup."""
+    configured = os.getenv("TRANSLATION_MODEL_DIR", "").strip()
+    if not configured or not Path(configured).is_dir():
+        return
+    try:
+        # Use the same lock as foreground translation so an early scan waits
+        # for the warmup instead of loading a second model copy in parallel.
+        with _lock:
+            _load_model()
+    except Exception:
+        # OCR remains available through the Latin transliteration fallback.
+        return
+
+
 def _translate_parts(parts: list[str], language: str = "hi") -> list[str]:
     torch, tokenizer, model = _load_model()
     tokenizer.src_lang = language
@@ -77,7 +92,9 @@ def _translate_parts(parts: list[str], language: str = "hi") -> list[str]:
         if inputs.input_ids.shape[1] > model.config.max_position_embeddings:
             raise ValueError("Source segment exceeds local model capacity")
         with torch.inference_mode():
-            output = model.generate(**inputs, num_beams=4, max_new_tokens=256, forced_bos_token_id=tokenizer.get_lang_id("en"))
+            # Card lines are short. Beam=1 and a bounded output avoid spending
+            # seconds exploring long translations for every brief field.
+            output = model.generate(**inputs, num_beams=1, max_new_tokens=128, forced_bos_token_id=tokenizer.get_lang_id("en"))
         results.extend(tokenizer.batch_decode(output, skip_special_tokens=True))
     return results
 

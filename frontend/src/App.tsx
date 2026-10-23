@@ -9,6 +9,7 @@ type Lead = {
   company_name: string;
   owner_name: string | null;
   designation: string | null;
+  business_description: string | null;
   company_address: string | null;
   contact_number: string | null;
   contact_numbers: string[];
@@ -29,6 +30,7 @@ type LeadForm = {
   company_name: string;
   owner_name: string;
   designation: string;
+  business_description: string;
   company_address: string;
   contact_numbers: string[];
   email_addresses: string[];
@@ -53,6 +55,8 @@ type ExtractedLeadFields = Omit<Partial<Record<keyof LeadForm, string | null>>, 
   review_warnings?: string[];
   qr_payloads?: string[];
   qr_data?: Record<string, unknown>[];
+  field_sources?: Record<string, { source_type: string; source_text: string; confidence: string }>;
+  processing_times_ms?: { ocr_ms?: number; translation_ms?: number; total_ms?: number };
 };
 type DocumentRecord = {
   id: string;
@@ -74,7 +78,7 @@ const LEADS_PAGE_SIZE = 50;
 
 function mergeExtractedFields(records: DocumentRecord[]): ExtractedLeadFields {
   const merged: ExtractedLeadFields = {};
-  for (const key of ["company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
+  for (const key of ["company_name", "owner_name", "designation", "business_description", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
     const value = records.map((record) => record.extracted_fields?.[key]).find((item) => typeof item === "string" && item.trim());
     if (value) merged[key] = value as string;
   }
@@ -91,6 +95,7 @@ const emptyForm: LeadForm = {
   company_name: "",
   owner_name: "",
   designation: "",
+  business_description: "",
   company_address: "",
   contact_numbers: [],
   email_addresses: [],
@@ -101,10 +106,11 @@ const emptyForm: LeadForm = {
   raw_text: "",
 };
 
-const fields: { key: "company_name" | "owner_name" | "designation" | "company_address" | "website" | "facebook_link" | "instagram_link" | "whatsapp_link"; label: string; placeholder: string }[] = [
+const fields: { key: "company_name" | "owner_name" | "designation" | "business_description" | "company_address" | "website" | "facebook_link" | "instagram_link" | "whatsapp_link"; label: string; placeholder: string }[] = [
   { key: "company_name", label: "Full company name", placeholder: "Example Technologies Pvt Ltd" },
   { key: "owner_name", label: "Owner name", placeholder: "Contact person" },
   { key: "designation", label: "Designation", placeholder: "Director, Manager, etc." },
+  { key: "business_description", label: "Business description / services", placeholder: "Products or services offered" },
   { key: "company_address", label: "Address", placeholder: "Enter address" },
   { key: "website", label: "Website", placeholder: "www.company.com" },
   { key: "facebook_link", label: "Facebook link", placeholder: "https://facebook.com/company" },
@@ -145,7 +151,7 @@ const EDITED_PREVIEW_MARKER = "[Edited preview]";
 function syncedRawText(form: LeadForm): string {
   const base = form.raw_text.split(/\n\s*\[Edited preview\]\s*\n/i)[0].trimEnd();
   const lines = [
-    ["Company name", form.company_name], ["Owner name", form.owner_name], ["Designation", form.designation],
+    ["Company name", form.company_name], ["Owner name", form.owner_name], ["Designation", form.designation], ["Business description", form.business_description],
     ["Address", form.company_address], ["Contact numbers", form.contact_numbers.join("; ")],
     ["Email addresses", form.email_addresses.join("; ")], ["Website", form.website],
     ["Facebook", form.facebook_link], ["Instagram", form.instagram_link], ["WhatsApp", form.whatsapp_link],
@@ -160,22 +166,24 @@ function updateFormField(current: LeadForm, patch: Partial<LeadForm>): LeadForm 
 
 function updateFormFromDocumentText(current: LeadForm, rawText: string): LeadForm {
   const next: Partial<LeadForm> = {};
-  const value = (label: string) => rawText.match(new RegExp(`^\\s*${label}\\s*:\\s*(.+)$`, "im"))?.[1]?.trim() || "";
+  const value = (label: string) => rawText.match(new RegExp(`^\\s*${label}\\s*:\\s*(.*)$`, "im"))?.[1]?.trim();
   const company = value("(?:full\\s+)?company(?:\\s+name)?");
   const owner = value("owner(?:\\s+name)?|contact(?:\\s+person)?");
   const designation = value("designation|title|position");
+  const description = value("business description|company description|description|services");
   const address = value("address");
   const contact = value("contact(?:\\s+numbers?)?|phone(?:\\s+numbers?)?");
   const emails = value("emails?|email\\s+addresses?");
-  if (company) next.company_name = company;
-  if (owner) next.owner_name = owner;
-  if (designation) next.designation = designation;
-  if (address) next.company_address = address;
-  if (contact) next.contact_numbers = listFromText(contact, /[;,]+/);
-  if (emails) next.email_addresses = listFromText(emails, /[;,]+/);
+  if (company !== undefined) next.company_name = company;
+  if (owner !== undefined) next.owner_name = owner;
+  if (designation !== undefined) next.designation = designation;
+  if (description !== undefined) next.business_description = description;
+  if (address !== undefined) next.company_address = address;
+  if (contact !== undefined) next.contact_numbers = listFromText(contact, /[;,]+/);
+  if (emails !== undefined) next.email_addresses = listFromText(emails, /[;,]+/);
   for (const [key, label] of [["website", "website"], ["facebook_link", "facebook"], ["instagram_link", "instagram"], ["whatsapp_link", "whatsapp"]] as const) {
     const item = value(label);
-    if (item) next[key] = item;
+    if (item !== undefined) next[key] = item;
   }
   return { ...current, ...next, raw_text: rawText };
 }
@@ -200,6 +208,7 @@ function formFromExtracted(extracted: ExtractedLeadFields, cardIndex = 0): LeadF
     company_name: textValue(candidate.company_name),
     owner_name: textValue(candidate.owner_name),
     designation: textValue(candidate.designation),
+    business_description: textValue(candidate.business_description),
     company_address: textValue(candidate.company_address),
     contact_numbers: stringValues(candidate.contact_numbers, candidate.contact_number).map(indianPhone),
     email_addresses: stringValues(candidate.email_addresses, candidate.email),
@@ -713,6 +722,7 @@ function App() {
       company_name: lead.company_name,
       owner_name: lead.owner_name || "",
       designation: lead.designation || "",
+      business_description: lead.business_description || "",
       company_address: lead.company_address || "",
       contact_numbers: lead.contact_numbers?.length ? lead.contact_numbers : lead.contact_number ? [lead.contact_number] : [],
       email_addresses: lead.email_addresses?.length ? lead.email_addresses : lead.email ? [lead.email] : [],
@@ -734,6 +744,7 @@ function App() {
           ...current,
           company_address: current.company_address.trim() || combineAddress(extracted.company_address, extracted.city, extracted.district, extracted.state),
           designation: current.designation || extracted.designation || "",
+          business_description: current.business_description || extracted.business_description || "",
           contact_numbers: mergeValues(current.contact_numbers, extracted.contact_numbers),
           email_addresses: mergeValues(current.email_addresses, extracted.email_addresses),
           raw_text: current.raw_text || extracted.raw_text || "",
@@ -759,6 +770,7 @@ function App() {
       ...form,
       owner_name: form.owner_name || null,
       designation: form.designation || null,
+      business_description: form.business_description || null,
       company_address: form.company_address || null,
       contact_numbers: form.contact_numbers,
       contact_number: form.contact_numbers[0] || null,
@@ -978,6 +990,9 @@ function App() {
                 {busy && <p className="processing-note"><span className="spinner" />Reading document…</p>}
                 {(document.extracted_fields.cards?.[activeCardIndex]?.translation_message || document.extracted_fields.translation_message) && <p role="status" className="review-warning">{textValue(document.extracted_fields.cards?.[activeCardIndex]?.translation_message || document.extracted_fields.translation_message)}</p>}
                 {(document.extracted_fields.cards?.[activeCardIndex]?.review_warnings || document.extracted_fields.review_warnings || []).length > 0 && <ul className="review-warning" role="status">{(document.extracted_fields.cards?.[activeCardIndex]?.review_warnings || document.extracted_fields.review_warnings || []).map((warning) => <li key={warning}>{warning}</li>)}</ul>}
+                {(() => { const measured = document.extracted_fields.cards?.[activeCardIndex]?.processing_times_ms || document.extracted_fields.processing_times_ms; return measured ? <p className="processing-note">Scan time: OCR {((measured.ocr_ms || 0) / 1000).toFixed(1)}s · translation {((measured.translation_ms || 0) / 1000).toFixed(1)}s · total {((measured.total_ms || 0) / 1000).toFixed(1)}s</p> : null; })()}
+                {(() => { const sources = document.extracted_fields.cards?.[activeCardIndex]?.field_sources || document.extracted_fields.field_sources; const entries = Object.entries(sources || {}); return entries.length ? <details><summary>Source line for each extracted field</summary><ul>{entries.map(([key, source]) => <li key={key}><strong>{key.replace(/_/g, " ")}</strong> · {source.source_type} · {source.confidence === "high" ? "high confidence" : "check against card"}: <span>{source.source_text || "No exact source line found"}</span></li>)}</ul></details> : null; })()}
+                {!!(document.extracted_fields.cards?.[activeCardIndex]?.qr_payloads || document.extracted_fields.qr_payloads)?.length && <details><summary>QR code data for verification</summary><pre style={{ whiteSpace: "pre-wrap" }}>{(document.extracted_fields.cards?.[activeCardIndex]?.qr_payloads || document.extracted_fields.qr_payloads || []).join("\n\n")}</pre></details>}
                 {!!(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text) && <details><summary>Original OCR text</summary><pre style={{ whiteSpace: "pre-wrap" }}>{textValue(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text)}</pre></details>}
                 {!busy && document.processing_status !== "uploaded" && document.processing_status !== "processing" && !editingLead && <button type="button" className="text-button" onClick={() => void retryDocument(document)}>Re-scan and translate</button>}
               </div>}
@@ -985,7 +1000,7 @@ function App() {
               <div className="form-heading"><span className="eyebrow">LEAD INFORMATION</span><h2>{editingLead ? editingLead.lead_number : document?.extracted_fields.cards && document.extracted_fields.cards.length > 1 ? `Card ${activeCardIndex + 1} of ${document.extracted_fields.cards.length}` : "Add lead"}</h2><p>{editingLead ? "Correct any details, then save your changes." : "Enter the company information and save the lead."}</p></div>
               <form onSubmit={saveLead}>
                 {fields.map((field) => <label className="field" key={field.key}><span>{field.label}{field.key === "company_name" && <b>Required</b>}</span>
-                {field.key === "company_address" ? <textarea rows={3} value={form.company_address} onChange={(event) => setForm((current) => updateFormField(current, { company_address: event.target.value }))} placeholder={field.placeholder} /> : <input value={form[field.key] || ""} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} required={field.key === "company_name"} />}
+                {field.key === "company_address" || field.key === "business_description" ? <textarea rows={3} value={form[field.key]} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} /> : <input value={form[field.key] || ""} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} required={field.key === "company_name"} />}
                 </label>)}
                 <label className="field"><span>Contact numbers <small>One per line</small></span><textarea rows={3} value={form.contact_numbers.join("\n")} onChange={(event) => setForm((current) => updateFormField(current, { contact_numbers: listFromText(event.target.value) }))} placeholder={"+91 98765 43210\n+91 98765 43211"} /></label>
                 <label className="field"><span>Email addresses <small>One per line</small></span><textarea rows={3} value={form.email_addresses.join("\n")} onChange={(event) => setForm((current) => updateFormField(current, { email_addresses: listFromText(event.target.value, /[\n;,]+/) }))} placeholder="name@company.com&#10;sales@company.com" /></label>
@@ -1008,6 +1023,7 @@ function App() {
               <div><dt>Data check</dt><dd>{viewingLead.verification_status === "verified" ? "Checked" : viewingLead.document_id ? "OCR needs review" : "Imported data needs review"}</dd></div>
               <div><dt>Owner / contact</dt><dd>{viewingLead.owner_name || "—"}</dd></div>
               <div><dt>Designation</dt><dd>{viewingLead.designation || "—"}</dd></div>
+              <div><dt>Business description / services</dt><dd>{viewingLead.business_description || "—"}</dd></div>
               <div><dt>Address</dt><dd>{viewingLead.company_address || "—"}</dd></div>
               <div><dt>Contact numbers</dt><dd>{(viewingLead.contact_numbers?.length ? viewingLead.contact_numbers : viewingLead.contact_number ? [viewingLead.contact_number] : []).length ? (viewingLead.contact_numbers?.length ? viewingLead.contact_numbers : [viewingLead.contact_number!]).map((number) => <a className="detail-value" key={number} href={`tel:${number.replace(/[^+\d]/g, "")}`}>{indianPhone(number)}</a>) : "—"}</dd></div>
               <div><dt>Email addresses</dt><dd>{(viewingLead.email_addresses?.length ? viewingLead.email_addresses : viewingLead.email ? [viewingLead.email] : []).length ? (viewingLead.email_addresses?.length ? viewingLead.email_addresses : [viewingLead.email!]).map((address) => <a className="detail-value" key={address} href={`mailto:${address}`}>{address}</a>) : "—"}</dd></div>

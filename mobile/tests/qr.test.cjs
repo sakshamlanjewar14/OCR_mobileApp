@@ -20,3 +20,10 @@ test('unsafe or unknown payloads stay as source text and are never opened or fet
   const value=parseQrPayload('https://user:secret@unknown.example/path');
   assert.equal(value.unmapped,true); assert.equal(value.urls.length,0); assert.equal(value.source_text,'https://user:secret@unknown.example/path');
 });
+
+test('QR redirect service URLs remain source data, not company websites', () => {
+  const value = parseQrPayload('https://api.singleqr.in/r/example');
+  assert.equal(value.website, undefined);
+  assert.equal(value.qr_redirect_url, 'https://api.singleqr.in/r/example');
+  assert.equal(value.source_text, 'https://api.singleqr.in/r/example');
+});

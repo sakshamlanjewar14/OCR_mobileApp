@@ -36,6 +36,7 @@ class Lead(Base):
     company_name: Mapped[str] = mapped_column(String(255), index=True)
     owner_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     designation: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    business_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     company_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     website: Mapped[str | None] = mapped_column(String(500), nullable=True)
     facebook_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
