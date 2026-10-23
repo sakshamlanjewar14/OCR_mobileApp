@@ -422,13 +422,34 @@ function App() {
       setCameraError("This browser cannot open the camera here. Use the photo upload option instead.");
       return;
     }
-    navigator.mediaDevices?.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false })
+    navigator.mediaDevices?.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 2560 },
+        height: { ideal: 1440 },
+        frameRate: { ideal: 30, max: 30 },
+      },
+      audio: false,
+    })
       .then((stream) => {
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
         cameraStreamRef.current = stream;
+        const track = stream.getVideoTracks()[0];
+        if (track && "getCapabilities" in track && "applyConstraints" in track) {
+          const capabilities = track.getCapabilities() as MediaTrackCapabilities & Record<string, unknown>;
+          const continuousSettings: Record<string, string | boolean> = {};
+          for (const setting of ["focusMode", "exposureMode", "whiteBalanceMode"]) {
+            const values = capabilities[setting];
+            if (Array.isArray(values) && values.includes("continuous")) continuousSettings[setting] = "continuous";
+          }
+          if (capabilities.imageStabilization === true) continuousSettings.imageStabilization = true;
+          if (Object.keys(continuousSettings).length) {
+            void track.applyConstraints({ advanced: [continuousSettings] as MediaTrackConstraintSet[] }).catch(() => undefined);
+          }
+        }
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           void videoRef.current.play();
@@ -640,11 +661,31 @@ function App() {
       setCameraError("The camera is still starting. Wait a moment and try again.");
       return;
     }
-    const canvas = window.document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+    let blob: Blob | null = null;
+    try {
+      const track = cameraStreamRef.current?.getVideoTracks()[0];
+      const ImageCaptureApi = window.ImageCapture;
+      if (track && ImageCaptureApi) {
+        try {
+          blob = await new ImageCaptureApi(track).takePhoto();
+        } catch {
+          // Fall back to the full-resolution live frame on browsers that expose
+          // ImageCapture but cannot take a still photo from this camera.
+        }
+      }
+      if (!blob) {
+        const canvas = window.document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Canvas is unavailable");
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.98));
+      }
+    } catch {
+      setCameraError("Could not capture the photo. Keep the card steady and try again.");
+      return;
+    }
     if (!blob) {
       setCameraError("Could not capture the photo. Try again or upload an image.");
       return;
@@ -1015,7 +1056,7 @@ function App() {
             </div>
           </section>
         )}
-        {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture card images</h2><p>{cameraFiles.length ? `${cameraFiles.length} image${cameraFiles.length === 1 ? "" : "s"} captured. Capture the back side too, then scan.` : "Capture the front side, then optionally capture the back side."}</p></div><button className="details-close" aria-label="Close camera" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>Cancel</button><button className="button button-secondary" onClick={() => void capturePhoto()}>Capture {cameraFiles.length ? "another" : "image"}</button><button className="button button-primary" onClick={() => void finishCameraScan()} disabled={!cameraFiles.length}>Scan {cameraFiles.length || ""} image{cameraFiles.length === 1 ? "" : "s"}</button></div></section></div>}
+        {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture card images</h2><p>{cameraFiles.length ? `${cameraFiles.length} image${cameraFiles.length === 1 ? "" : "s"} captured. Capture the back side too, then scan.` : "Capture the front side, then optionally capture the back side."}</p><p className="camera-tip">For a sharper scan, use bright even light, hold the phone steady, and fit the whole card inside the frame.</p></div><button className="details-close" aria-label="Close camera" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>Cancel</button><button className="button button-secondary" onClick={() => void capturePhoto()}>Capture {cameraFiles.length ? "another" : "image"}</button><button className="button button-primary" onClick={() => void finishCameraScan()} disabled={!cameraFiles.length}>Scan {cameraFiles.length || ""} image{cameraFiles.length === 1 ? "" : "s"}</button></div></section></div>}
         {viewingLead && <div className="details-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setViewingLead(null); }}>
           <section className="details-dialog" role="dialog" aria-modal="true" aria-labelledby="details-title">
             <header className="details-heading"><div><span className="eyebrow">LEAD DETAILS</span><h2 id="details-title">{viewingLead.company_name}</h2><p>{viewingLead.lead_number}</p></div><button className="details-close" aria-label="Close details" onClick={() => setViewingLead(null)}>×</button></header>
