@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from backend.app.ocr import _merge_qr_fields, _parse_fields, _read_image_with_layout, _split_card_image
+from backend.app.ocr import _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _split_card_image
 
 
 class OCRLatencyRegressionTests(unittest.TestCase):
@@ -17,6 +17,14 @@ class OCRLatencyRegressionTests(unittest.TestCase):
         self.assertEqual(text, "Acme Business Card")
         self.assertEqual(heights, {})
         windows_ocr.assert_called_once_with(image)
+
+    def test_complete_english_card_skips_recovery_only_for_missing_designation(self) -> None:
+        image = Image.new("RGB", (900, 500), "white")
+        with patch("backend.app.ocr._read_image_with_layout", return_value=(
+            "Acme Industries Pvt Ltd\nJane Doe\n+91 9876543210", {}
+        )), patch("backend.app.ocr._read_recovery_crops") as recovery:
+            _read_card_text(image)
+        recovery.assert_not_called()
 
 
 class CombinedCardImageTests(unittest.TestCase):
@@ -39,6 +47,94 @@ class CombinedCardImageTests(unittest.TestCase):
 
 
 class LeadFieldParsingTests(unittest.TestCase):
+    def test_sample_barbowws_cta_does_not_become_owner_or_designation(self) -> None:
+        fields = _parse_fields(
+            "SALON PARTNERS\nJoin as a Partner\nkapil@barbowws.com\n"
+            "www.barbowws.com\nPune, India\nBook your appointment\n"
+            "Check estimated waiting time\nAlert before 30 minutes"
+        )
+
+        self.assertEqual(fields["company_name"], "Barbowws")
+        self.assertIsNone(fields["owner_name"])
+        self.assertIsNone(fields["designation"])
+
+    def test_recovery_ocr_adds_missed_card_lines_without_dropping_primary_data(self) -> None:
+        primary = "SALON PARTNERS\nJoin as a Partner\nkapil@barbowws.com\nwww.barbowws.com"
+        recovered = "KAPIL KADAM\nFounder & CEO\n+91 7066336455"
+        text = _merge_ocr_transcripts(primary, recovered)
+        fields = _parse_fields(text)
+
+        self.assertIn("kapil@barbowws.com", text)
+        self.assertIn("KAPIL KADAM", text)
+        self.assertEqual(fields["company_name"], "Barbowws")
+        self.assertEqual(fields["owner_name"], "KAPIL KADAM")
+        self.assertEqual(fields["designation"], "Founder & CEO")
+        self.assertIn("7066336455", fields["contact_numbers"][0])
+
+    def test_sample_anmol_card_transliterated_english_field_mapping(self) -> None:
+        fields = _parse_fields(
+            "Anmol Fashion Boutique\nMeenakshi Verma\n"
+            "9305365913\n106/2A, Gupta Market, Near Gopal Talkies, "
+            "Above Mummy Papa Showroom, P. Road, Kanpur 208012"
+        )
+
+        self.assertEqual(fields["company_name"], "Anmol Fashion Boutique")
+        self.assertEqual(fields["owner_name"], "Meenakshi Verma")
+        self.assertEqual(fields["contact_numbers"], ["9305365913"])
+        self.assertIn("Kanpur 208012", fields["company_address"])
+
+    def test_anmol_ocr_company_fragment_is_left_blank_for_review(self) -> None:
+        source = (
+            "106/2ए, गुप्ता मार्केट, निकट गोपाल टाकीज\nमम्मी पापा शोरूम के ऊपर, पी.रोड, कानपुर-208012\n"
+            "मीनाक्षी वर्मा\n9305365913\nअलमोल\nशन बूटीक\nसभी प्रकार के डिजाइनर सलवार सूट"
+        )
+        fields = _parse_fields(source)
+        self.assertIsNone(fields["company_name"])
+        self.assertEqual(fields["owner_name"], "मीनाक्षी वर्मा")
+        self.assertEqual(fields["contact_numbers"], ["9305365913"])
+        self.assertIn("कानपुर-208012", fields["company_address"])
+        from backend.app.ocr import _fields_from_ocr_text
+        with patch("backend.app.ocr.translate_document_text", return_value=(None, "unavailable")):
+            preview = _fields_from_ocr_text(source)
+        self.assertTrue(any("Company name" in warning for warning in preview["review_warnings"]))
+
+    def test_sample_barbowws_full_ocr_text_maps_owner_title_contacts_and_website(self) -> None:
+        fields = _parse_fields(
+            "KAPIL KADAM\nFounder & CEO\n+91 7066336455\nkapil@barbowws.com\n"
+            "www.barbowws.com\nPune, India\nSALON PARTNERS\nJoin as a Partner\n"
+            "Book your appointment | Check estimated waiting time | Alert before 30 minutes"
+        )
+        self.assertEqual(fields["company_name"], "Barbowws")
+        self.assertEqual(fields["owner_name"], "KAPIL KADAM")
+        self.assertEqual(fields["designation"], "Founder & CEO")
+        self.assertEqual(fields["contact_numbers"], ["+91 7066336455"])
+        self.assertEqual(fields["email_addresses"], ["kapil@barbowws.com"])
+        self.assertEqual(fields["website"], "www.barbowws.com")
+
+    def test_sample_vastu_card_uses_adjacent_brand_words_validated_by_website(self) -> None:
+        fields = _parse_fields(
+            "VASTU\nRAVIRAJ\nAmit Nalawade\nMarketing Executive\n"
+            "+91 86558 73467\namit@vasturaviraj.in\nwwwvasturaviraj.co.in"
+        )
+        self.assertEqual(fields["company_name"], "VASTU RAVIRAJ")
+        self.assertEqual(fields["owner_name"], "Amit Nalawade")
+        self.assertEqual(fields["designation"], "Marketing Executive")
+        self.assertEqual(fields["contact_numbers"], ["+91 86558 73467"])
+        self.assertEqual(fields["website"], "www.vasturaviraj.co.in")
+
+    def test_sample_aditi_card_recovers_company_suffix_from_matching_email(self) -> None:
+        fields = _parse_fields(
+            "Yuvraj Phalke\nAditi Sales Corpor\nHouse of O Rings & Seals\n"
+            "Shop No. 210, Swapnanagari, Udyam Nagar, Pimpri Pune - 18.\n"
+            "Tel. 020-27502355 Telefax: 020-27124465\n"
+            "aditisalescorporation@gmail.com\nu.asc@rediffmail.com"
+        )
+        self.assertEqual(fields["company_name"], "Aditi Sales Corporation")
+        self.assertEqual(fields["owner_name"], "Yuvraj Phalke")
+        self.assertIn("Pimpri Pune", fields["company_address"])
+        self.assertEqual(fields["telephone_numbers"], ["020-27502355"])
+        self.assertEqual(fields["email_addresses"], ["aditisalescorporation@gmail.com", "u.asc@rediffmail.com"])
+
     def test_explicit_qr_contact_overrides_ambiguous_ocr_value(self) -> None:
         fields = _merge_qr_fields(
             {"company_name": "Wrong OCR Brand", "owner_name": None, "contact_numbers": []},

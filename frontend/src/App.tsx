@@ -50,6 +50,7 @@ type ExtractedLeadFields = Omit<Partial<Record<keyof LeadForm, string | null>>, 
   original_ocr_text?: string | null;
   translation_status?: string | null;
   translation_message?: string | null;
+  review_warnings?: string[];
   qr_payloads?: string[];
   qr_data?: Record<string, unknown>[];
 };
@@ -81,6 +82,7 @@ function mergeExtractedFields(records: DocumentRecord[]): ExtractedLeadFields {
   merged.email_addresses = stringValues(records.flatMap((record) => record.extracted_fields?.email_addresses || []));
   merged.raw_text = records.map((record) => record.extracted_fields?.raw_text).filter((item): item is string => Boolean(item)).join("\n\n");
   merged.original_ocr_text = records.map((record) => record.extracted_fields?.original_ocr_text).filter((item): item is string => Boolean(item)).join("\n\n");
+  merged.review_warnings = [...new Set(records.flatMap((record) => record.extracted_fields?.review_warnings || []))];
   merged.qr_payloads = records.flatMap((record) => record.extracted_fields?.qr_payloads || []);
   return merged;
 }
@@ -975,6 +977,7 @@ function App() {
                 {selectableScanIssues.some((item) => item.id !== document.id) && <label className="draft-picker"><span>Uploaded drafts in this batch</span><select value="" onChange={(event) => { const next = selectableScanIssues.find((item) => item.id === event.target.value); if (next) void reviewDocument(next); }}><option value="">Open another draft…</option>{selectableScanIssues.filter((item) => item.id !== document.id).map((item) => <option value={item.id} key={item.id}>{item.original_filename} · {item.processing_status.replace("_", " ")}</option>)}</select></label>}
                 {busy && <p className="processing-note"><span className="spinner" />Reading document…</p>}
                 {(document.extracted_fields.cards?.[activeCardIndex]?.translation_message || document.extracted_fields.translation_message) && <p role="status" className="review-warning">{textValue(document.extracted_fields.cards?.[activeCardIndex]?.translation_message || document.extracted_fields.translation_message)}</p>}
+                {(document.extracted_fields.cards?.[activeCardIndex]?.review_warnings || document.extracted_fields.review_warnings || []).length > 0 && <ul className="review-warning" role="status">{(document.extracted_fields.cards?.[activeCardIndex]?.review_warnings || document.extracted_fields.review_warnings || []).map((warning) => <li key={warning}>{warning}</li>)}</ul>}
                 {!!(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text) && <details><summary>Original OCR text</summary><pre style={{ whiteSpace: "pre-wrap" }}>{textValue(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text)}</pre></details>}
                 {!busy && document.processing_status !== "uploaded" && document.processing_status !== "processing" && !editingLead && <button type="button" className="text-button" onClick={() => void retryDocument(document)}>Re-scan and translate</button>}
               </div>}

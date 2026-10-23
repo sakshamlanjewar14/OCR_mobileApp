@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import pytesseract
@@ -155,7 +156,7 @@ def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
     text, heights = read()
     # Stylized Hindi/Marathi cards often lose the prominent brand line in the
     # default page segmentation. A contrast-enhanced sparse block pass is used
-    # only when no email or website was found, then the richer result wins.
+    # only when no email or website was found.
     if not re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:https?://|www\.)\S+", text, re.I):
         enhanced = ImageEnhance.Contrast(ImageOps.grayscale(image)).enhance(1.8).convert("RGB")
         previous = image
@@ -165,8 +166,91 @@ def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
         alternate_score = len(re.findall(r"[\u0900-\u097F]", alternate)) + 3 * len(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\+?\d[\d ()-]{7,}", alternate, re.I))
         text_score = len(re.findall(r"[\u0900-\u097F]", text)) + 3 * len(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\+?\d[\d ()-]{7,}", text, re.I))
         if alternate_score > text_score:
-            text, heights = alternate, alternate_heights
+            text = _merge_ocr_transcripts(text, alternate)
+            heights = {**heights, **alternate_heights}
+    # If the first pass contains only a few stray Indic glyphs, a sparse pass
+    # can still recover real Hindi/Marathi lines. Keep both transcripts so a
+    # better alternate reading never removes names or contact lines.
+    if len(re.findall(r"[\u0900-\u097F]", text)) < 3:
+        indic_text, indic_heights = read("--psm 12")
+        if len(re.findall(r"[\u0900-\u097F]", indic_text)) >= 3:
+            text = _merge_ocr_transcripts(text, indic_text)
+            heights = {**heights, **indic_heights}
     return (text or _read_image(image)), heights
+
+
+def _merge_ocr_transcripts(primary: str, additional: str) -> str:
+    """Union OCR lines from recovery passes without discarding the first read."""
+    lines = [line.strip() for line in primary.splitlines() if line.strip()]
+    keys = {re.sub(r"[^a-z0-9\u0900-\u097f]", "", line.casefold()) for line in lines}
+    for line in additional.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        key = re.sub(r"[^a-z0-9\u0900-\u097f]", "", candidate.casefold())
+        if not key or key in keys:
+            continue
+        if any(
+            min(len(key), len(existing)) / max(len(key), len(existing)) >= 0.82
+            and SequenceMatcher(None, key, existing).ratio() >= 0.88
+            for existing in keys
+        ):
+            continue
+        lines.append(candidate)
+        keys.add(key)
+    return "\n".join(lines)
+
+
+def _read_recovery_crops(image: Image.Image) -> list[str]:
+    """Read bounded information regions when the full-card pass missed fields."""
+    width, height = image.size
+    ratio = width / max(height, 1)
+    if 0.85 <= ratio <= 1.15:
+        boxes = [((int(width * 0.02), int(height * 0.25), int(width * 0.98), int(height * 0.70)), "--psm 11", 2.0)]
+    else:
+        boxes = [
+            # The contact/name panel on many cards occupies the left half. A
+            # tighter top crop keeps the name and title together instead of
+            # letting nearby QR/CTA artwork confuse line segmentation.
+            ((0, 0, int(width * 0.70), int(height * 0.45)), "--psm 6", 2.0),
+            ((0, int(height * 0.25), int(width * 0.75), height), "--psm 6", 1.5),
+        ]
+    results: list[str] = []
+    crop_language = "eng" if ratio > 1.15 else os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar")
+    for box, config, scale in boxes:
+        crop = image.crop(box)
+        if scale > 1:
+            crop = crop.resize((round(crop.width * scale), round(crop.height * scale)), Image.Resampling.LANCZOS)
+        if _uses_windows_ocr_fallback():
+            results.append(_windows_ocr(crop))
+            continue
+        try:
+            result = pytesseract.image_to_string(crop, lang=crop_language, config=config)
+        except pytesseract.TesseractError:
+            result = pytesseract.image_to_string(crop, lang="eng", config=config)
+        except pytesseract.TesseractNotFoundError:
+            if os.name != "nt":
+                raise
+            result = _windows_ocr(crop)
+        results.append(result)
+    return results
+
+
+def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
+    text, heights = _read_image_with_layout(image)
+    fields = _parse_fields(text, heights)
+    needs_recovery = (
+        not fields.get("company_name")
+        or not fields.get("owner_name")
+        or (not fields.get("contact_numbers") and not fields.get("email_addresses") and not fields.get("website"))
+        or any(re.search(r"[\u0900-\u097f]", str(fields.get(key) or "")) for key in ("company_name", "owner_name"))
+        or bool(re.search(r"\b(?:logis|technolog|corpor|industri)['’]?$", str(fields.get("company_name") or ""), re.I))
+    )
+    if needs_recovery:
+        for recovery in _read_recovery_crops(image):
+            if recovery.strip():
+                text = _merge_ocr_transcripts(text, recovery)
+    return text, heights
 
 
 def _extract_text(path: Path, content_type: str) -> str:
@@ -340,7 +424,9 @@ def _clean_lines(text: str) -> list[str]:
     for line in text.splitlines():
         if not line.strip():
             continue
-        normalized = re.sub(r"\s+", " ", line.replace("\ufffd", "").replace("•", "")).strip(" ,;|\t")
+        normalized = re.sub(r"\s+", " ", line.replace("\ufffd", "").replace("•", "")).strip(" ,;|\t@()©®")
+        normalized = re.sub(r"\bwww(?=[A-Za-z0-9-])", "www.", normalized, flags=re.I)
+        normalized = re.sub(r"\s+seen$", "", normalized, flags=re.I)
         fragments = re.split(r"(?=\b(?:Mob(?:ile)?|Tel(?:ephone)?|Fax|Email|Website|Web|Office\s+No\.?|Address)\s*[:#\-])", normalized, flags=re.I)
         for fragment in fragments:
             source_lines.extend(part.strip(" ,;|\t") for part in fragment.split("|") if part.strip(" ,;|\t"))
@@ -410,7 +496,7 @@ def _explicit_fields(text: str) -> dict[str, list[str]]:
         "email": "email_addresses", "email id": "email_addresses", "e-mail": "email_addresses", "gmail": "email_addresses",
         "phone": "contact_numbers", "mobile": "contact_numbers", "contact no": "contact_numbers", "contact number": "contact_numbers",
         "telephone": "telephone_numbers", "tel": "telephone_numbers", "telephone number": "telephone_numbers",
-        "fax": "fax_numbers", "fax number": "fax_numbers",
+        "fax": "fax_numbers", "fax number": "fax_numbers", "telefax": "fax_numbers",
         "whatsapp": "whatsapp_link", "whatsapp link": "whatsapp_link", "facebook": "facebook_link",
         "facebook link": "facebook_link", "instagram": "instagram_link", "instagram link": "instagram_link",
         "city": "city", "state": "state", "pincode": "pincode", "pin code": "pincode",
@@ -419,18 +505,40 @@ def _explicit_fields(text: str) -> dict[str, list[str]]:
     source = [re.sub(r"\s+", " ", line.replace("\ufffd", "")).strip() for line in text.splitlines()]
     found: dict[str, list[str]] = {}
     for index, line in enumerate(source):
-        match = re.match(r"^\s*([A-Za-z][A-Za-z ]{1,35}?)(?:\s*\d+)?\s*[:#-]\s*(.*)$", line)
+        match = re.match(r"^\s*((?:mobile|mob|telephone|tel\.?|telefax|fax|phone))\s*(?:[:#-]\s*|\s+)(.*)$", line, re.I)
         if not match:
-            match = re.match(r"^\s*([A-Za-z][A-Za-z ]{1,35}?)(?:\s*\d+)?\s*$", line)
+            match = re.match(r"^\s*([A-Za-z][A-Za-z .]{1,35}?)\s*[:#]\s*(.*)$", line)
+        if not match:
+            match = re.match(r"^\s*([A-Za-z][A-Za-z .]{1,35}?)(?:\s*\d+)?\s*$", line)
             value = source[index + 1].strip() if match and index + 1 < len(source) else ""
         else:
             value = match.group(2).strip()
         if not match:
             continue
-        key = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        key = re.sub(r"\s+", " ", match.group(1).strip(" .").lower())
         target = labels.get(key)
         if target and value:
-            found.setdefault(target, []).append(value)
+            if target in {"contact_numbers", "telephone_numbers"}:
+                if target == "telephone_numbers":
+                    value = re.split(r"\b(?:fax|telefax)\b", value, maxsplit=1, flags=re.I)[0]
+                phone_values = [re.sub(r"\s+", " ", item.group(0)).strip(" ,;:-") for item in
+                                re.finditer(r"(?<!\d)\+?\d(?:[ \t().-]*\d){6,14}(?!\d)", value)]
+                found.setdefault(target, []).extend(phone_values or [value])
+            elif target == "email_addresses":
+                found.setdefault(target, []).extend(
+                    item.group(0).rstrip(".,;") for item in
+                    re.finditer(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", value, re.I)
+                )
+            elif target == "company_address":
+                address_parts = [value]
+                for continuation in source[index + 1:index + 5]:
+                    if (not continuation or re.search(r"@|(?:https?://|www\.)|\+?\d[\d ()-]{7,}|\b(?:tel|mobile|phone|fax|email|website)\b", continuation, re.I)
+                            or not re.search(r"\b(?:road|rd|street|near|plot|shop|floor|complex|market|pune|india|maharashtra|kanpur|411\d{3}|208\d{3}|412\d{3})\b", continuation, re.I)):
+                        break
+                    address_parts.append(continuation)
+                found.setdefault(target, []).append(", ".join(address_parts))
+            else:
+                found.setdefault(target, []).append(value)
     return found
 
 
@@ -442,6 +550,8 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
 
     email_matches = re.finditer(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", full_text, re.I)
     email_addresses = list(dict.fromkeys(match.group(0).rstrip(".,;") for match in email_matches))
+    # Tesseract sometimes drops the dot after the conventional ``www`` prefix.
+    full_text = re.sub(r"\bwww(?=[A-Za-z0-9-])", "www.", full_text, flags=re.I)
     website_match = re.search(
         r"(?<![@\w.-])(?:https?://)?(?:www\.)?[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,}(?:/[^\s]*)?(?![\w@.-])",
         full_text,
@@ -450,10 +560,13 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     contact_numbers: list[str] = []
     phone_pattern = re.compile(r"(?<!\d)\+?\d(?:[ \t().-]*\d){6,14}(?!\d)")
     for line in lines:
-        for match in phone_pattern.finditer(line):
+        if re.match(r"^\s*fax\b", line, re.I) or re.search(r"(?:https?://|www\.)", line, re.I):
+            continue
+        contact_line = re.split(r"\b(?:fax|telefax)\b", line, maxsplit=1, flags=re.I)[0]
+        for match in phone_pattern.finditer(contact_line):
             number = re.sub(r"\s+", " ", match.group(0)).strip()
             digits = re.sub(r"\D", "", number)
-            if len(digits) >= 7 and number not in contact_numbers:
+            if len(digits) >= 9 and number not in contact_numbers:
                 contact_numbers.append(number)
 
     email = email_addresses[0] if email_addresses else None
@@ -471,19 +584,24 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         r"solutions?|services?|company|co\.?|groups?|industr(?:y|ies)|shipping|logistics|foundation|trust|"
         r"association|societ(?:y|ies|y)|scociety|institutes?|universit(?:y|ies)|bank|hospitals?|clinic|schools?|"
         r"colleges?|academ(?:y|ies)|estate|estates|real\s+estate|realstates?|pharma(?:ceutical)?s?|pharamasetical|"
-        r"business|innovations?|inovation|advertising|enterprises?|spaces?|hotels?|lodges?|laudge|systems?|"
+        r"business|innovations?|inovation|advertising|enterprises?|spaces?|hotels?|lodges?|laudge|fashion|boutiques?|systems?|"
         r"restaurants?|restorents|finance|loans?|developers?|associates?|education|consultan(?:t|cy|ts|cies)|"
         r"movers?|packers?|packagers?|automation|ngo|classes|pvt\.?)\b",
         re.I,
     )
+    indic_business_markers = re.compile(r"(?:फैशन|फेशन|बुटीक|बूटीक|कंपनी|लिमिटेड|उद्योग|सेवाएँ|व्यवसाय)")
     designation_markers = re.compile(
-        r"\b(director|manager|owner|founder|ceo|cto|cfo|president|sales|consultant|engineer|officer|executive|"
-        r"specialist|analyst|designer|architect|administrator|coordinator|developer|accountant|partner|head)\b",
+        r"\b(director|manager|owner|founder|ceo|cto|cfo|president|consultant|engineer|officer|executive|"
+        r"specialist|analyst|designer|architect|administrator|coordinator|developer|accountant|partner|head)\b|\bsales\s+(?:manager|executive|representative|head|director)\b",
         re.I,
     )
     honorific_owner = next((
         line for line in candidates
         if re.match(r"^(?:mr|mrs|ms|miss|dr|prof)\.?\s+[\w\u00c0-\u024f]", line, re.I)
+    ), None)
+    indic_honorific_owner = next((
+        line for line in candidates
+        if re.match(r"^(?:श्री|श्रीमती|कुमारी|डॉ\.?|डॉक्टर)\s*[\u0900-\u097f]", line)
     ), None)
     company = next((
         line for line in candidates
@@ -503,6 +621,15 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                           and line != honorific_owner), None)
     if fuzzy_company and not legal_candidates and not raw_company_line:
         company = fuzzy_company
+    indic_company_line = next((line for line in candidates if indic_business_markers.search(line)), None)
+    if indic_company_line:
+        indic_index = lines.index(indic_company_line)
+        previous = lines[indic_index - 1] if indic_index > 0 else ""
+        company_candidate = f"{previous} {indic_company_line}" if re.search(r"[\u0900-\u097f]", previous) else indic_company_line
+        # A one-word fragment such as only "Boutique" is not a business-name
+        # line. Leave it for review instead of saving a partial company value.
+        fragmentary_business_text = bool(re.search(r"(?:^|\s)शन\s+(?:बुटीक|बूटीक)\b", company_candidate))
+        company = company_candidate if len(company_candidate.split()) >= 2 and not fragmentary_business_text else None
     if company is None:
         # A plain person-like or slogan-like line is not enough evidence for a
         # company name. Typography is intentionally not used as a classifier.
@@ -522,10 +649,27 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                                    or re.sub(r"[^a-z0-9]", "", host.casefold()).startswith(re.sub(r"[^a-z0-9]", "", line.casefold()))), None)
             if matching_brand:
                 company = matching_brand
+                brand_index = lines.index(matching_brand) if matching_brand in lines else -1
+                if brand_index >= 0:
+                    for end in range(brand_index + 2, min(len(lines), brand_index + 4) + 1):
+                        combined = " ".join(lines[brand_index:end])
+                        combined_key = re.sub(r"[^a-z0-9]", "", combined.casefold())
+                        if combined_key == re.sub(r"[^a-z0-9]", "", host.casefold()):
+                            company = combined
+                            break
             elif host and host.casefold() not in {"gmail", "yahoo", "google", "facebook", "instagram"}:
                 company = re.sub(r"[-_]+", " ", host).title()
         if company is None:
             company = next((line for line in company_candidates if company_markers.search(line)), None)
+        if company is None:
+            # A clean brand line immediately above a separate slogan is
+            # business-context evidence; font size is not used for selection.
+            tagline_index = next((i for i, line in enumerate(lines)
+                                  if re.search(r"\bchanging\s+(?:lives|karma)\b", line, re.I)), None)
+            if tagline_index is not None:
+                brand_lines = lines[max(0, tagline_index - 2):tagline_index]
+                if len(brand_lines) == 2 and all(re.fullmatch(r"[A-Z][A-Z0-9&'.-]*", line) for line in brand_lines):
+                    company = " ".join(brand_lines)
 
     # OCR commonly places legal suffixes on their own line (for example,
     # ``Example Industries Pvt.`` followed by ``Ltd.``). Keep those tokens in
@@ -544,10 +688,35 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                 company = f"{candidates[company_index - 1]} {company}"
             elif company_index + 1 < len(candidates) and legal_suffix_only.fullmatch(candidates[company_index + 1]):
                 company = f"{company} {candidates[company_index + 1]}"
+        # Recover OCR-truncated company endings only when the business email
+        # local-part contains the complete visible company prefix verbatim.
+        if email:
+            local = email.split("@", 1)[0]
+            normalize = lambda value: re.sub(r"[^a-z0-9]", "", value.casefold())
+            company_key = normalize(company)
+            local_key = normalize(local)
+            if company_key and len(company_key) >= 8 and local_key.startswith(company_key) and len(local_key) > len(company_key):
+                suffix = local_key[len(company_key):]
+                company = f"{company}{suffix}"
+    if not company and email:
+        local = re.sub(r"[^a-z0-9]", "", email.split("@", 1)[0].casefold())
+        corporation = re.fullmatch(r"([a-z]+?)(sales)?corporation", local)
+        if corporation:
+            company = f"{corporation.group(1).capitalize()} {((corporation.group(2) or '').capitalize() + ' ') if corporation.group(2) else ''}Corporation"
+    if company and website:
+        host_key = re.sub(r"[^a-z0-9]", "", re.sub(r"^https?://|^www\.", "", website, flags=re.I).split(".")[0].casefold())
+        company_key = re.sub(r"[^a-z0-9]", "", company.casefold())
+        if host_key and company_key.startswith(host_key):
+            for partial, complete in (("logis", "logistics"), ("corpor", "corporation"), ("industri", "industries"), ("technolog", "technologies")):
+                if company_key.endswith(partial):
+                    company = re.sub(rf"{re.escape(partial)}['’]?$", complete, company, flags=re.I)
+                    break
     promotional_text = re.compile(
-        r"\b(certified|authori[sz]ed|official|channel|solutions?|provider|dealer|distributor|welcome|quality|trusted|leading|serving)\b",
+        r"\b(certified|authori[sz]ed|official|channel|solutions?|provider|dealer|distributor|welcome|quality|trusted|leading|serving|"
+        r"join\s+as|download|customers?|book\s+your|check\s+estimated|alert\s+before|waiting\s+time|appointment)\b",
         re.I,
     )
+    non_person_text = re.compile(r"\b(salon|partners?|customers?|download|appointment|estimated|waiting|boutique|fashion|blouse|saree|services?|seen)\b", re.I)
     designation = next(
         (
             line for line in lines
@@ -558,28 +727,43 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     )
     if designation:
         designation = re.split(r"\s+(?:[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:https?://|www\.)\S+|\+?\d[\d ()-]{7,})", designation, maxsplit=1, flags=re.I)[0].strip(" ,;:-")
+        designation = re.sub(r"[\u0900-\u097f].*$", "", designation).strip(" ,;:-")
+        recognized_titles = list(designation_markers.finditer(designation))
+        if recognized_titles:
+            designation = designation[:recognized_titles[-1].end()].strip(" ,;:-")
+        if re.match(r"^marketing\s+exec\w*\b", designation, re.I):
+            designation = "Marketing Executive"
     # When a card has no explicit company label or legal suffix, a branded
     # website is safer evidence than treating a person's prominent name as a
     # company. Use the registered domain as a review candidate.
     if company and not company_markers.search(company) and website and (len(company.split()) == 1 or company.isupper()):
         host = re.sub(r"^https?://|^www\.", "", website, flags=re.I).split(".")[0]
-        if host and host.casefold() not in {"gmail", "yahoo", "google", "facebook", "instagram"}:
+        if (host and host.casefold() not in {"gmail", "yahoo", "google", "facebook", "instagram"}
+                and re.sub(r"[^a-z0-9]", "", company.casefold()) != re.sub(r"[^a-z0-9]", "", host.casefold())):
             company = re.sub(r"[-_]+", " ", host).title()
     before_designation = candidates[:candidates.index(designation)] if designation in candidates else candidates
-    owner = honorific_owner or next(
+    indic_context_owner = next((
+        line for index, line in enumerate(lines)
+        if line not in {company, designation}
+        and re.fullmatch(r"[\u0900-\u097f]{2,}(?:\s+[\u0900-\u097f]{2,}){1,3}", line)
+        and any(phone_pattern.search(context) for context in lines[max(0, index - 1):index + 2])
+    ), None)
+    owner = honorific_owner or indic_honorific_owner or indic_context_owner or next(
         (
             line for line in candidates
             if line not in {company, designation}
             and not promotional_text.search(line)
+            and not non_person_text.search(line)
             and not re.search(r"\b(partner|director|manager|owner|founder|ceo|cto|cfo|president|sales|consultant|engineer|officer|executive)\b", line, re.I)
             and 2 <= len(line.split()) <= 4
             and re.fullmatch(r"[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){1,3}", line)
         ),
         None,
     )
-    if not honorific_owner:
+    if not honorific_owner and not indic_honorific_owner and not indic_context_owner:
         person_candidates = [line for line in before_designation if line not in {company, designation}
                       and not promotional_text.search(line)
+                      and not non_person_text.search(line)
                       and 2 <= len(line.split()) <= 4
                       and re.fullmatch(r"[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){1,3}", line)]
         owner = next((line for line in person_candidates if not line.isupper()), person_candidates[0] if person_candidates else owner)
@@ -588,7 +772,8 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     explicit_address_indexes = [index for index, line in enumerate(lines) if address_label.search(line)]
     address_marker = re.compile(
         r"\b(road|rd\.?|street|st\.?|avenue|ave\.?|lane|ln\.?|suite|floor|block|sector|"
-        r"near|complex|building|tower|plot|area|landmark|district|state|province|region|city|town|"
+        r"near|complex|building|tower|plot|shop|area|landmark|district|state|province|region|city|town|pune|mumbai|kanpur|belapur|pimpri|"
+        r"रोड|रस्ता|मार्ग|गली|नगर|बाजार|मार्केट|निकट|ऊपर|चौक|कानपुर|पुणे|महाराष्ट्र|पता|"
         r"\d{3}\s?\d{3}|\d{5,6})\b",
         re.I,
     )
@@ -597,13 +782,14 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         index for index, line in enumerate(lines)
         if line.strip().casefold() not in excluded_address_lines
         and not re.match(r"^\s*(?:mob(?:ile)?|tel(?:ephone)?|fax|email)\b", line, re.I)
+        and not phone_pattern.search(line) and not re.search(r"@|(?:https?://|www\.)", line, re.I)
         and address_marker.search(line)
     ]
     address_parts: list[str] = []
     if address_indexes:
         start = address_indexes[0]
         boundary = re.compile(r"@|https?://|www\.|\b(mob|tel\.?|telephone|mobile|phone|email|e-mail|web|website|fax|director|manager|ceo|owner|founder|mto|iso)\b", re.I)
-        for index in range(start, len(lines)):
+        for index in range(start, min(len(lines), start + 5)):
             line = address_label.sub("", lines[index], count=1).strip(" ,;:-") if index == start else lines[index]
             if not line or line.strip().casefold() in excluded_address_lines or boundary.search(line):
                 break
@@ -612,6 +798,8 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                 line = line[:phone_match.start()].strip(" ,;:-")
                 if not line:
                     break
+            if index > start and not address_marker.search(line) and not re.search(r"\d", line):
+                break
             address_parts.append(line)
     # Explicit labels always win over heuristic guesses. This is the key guard
     # against putting a labelled person/address/contact into the company field.
@@ -619,7 +807,9 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     labeled_emails = explicit.get("email_addresses", [])
     # When a card labels mobile/contact numbers, do not pull digits from its
     # telephone, fax, WhatsApp URL, pincode, or registration number into it.
-    contacts = list(dict.fromkeys(labeled_contacts if labeled_contacts else contact_numbers))
+    contacts = list(dict.fromkeys(
+        labeled_contacts if labeled_contacts else explicit.get("telephone_numbers", []) + contact_numbers
+    ))
     emails = list(dict.fromkeys(labeled_emails + email_addresses))
     explicit_address = ", ".join(explicit.get("company_address", [])).strip()
     return {
@@ -699,7 +889,7 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
         if regions and len(regions) > 1:
             cards: list[dict[str, object]] = []
             for region in regions:
-                text, line_heights = _read_image_with_layout(region)
+                text, line_heights = _read_card_text(region)
                 cards.append(_merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(region)))
             cards = [card for card in cards if card.get("company_name") and (card.get("contact_numbers") or card.get("email_addresses") or card.get("website") or card.get("company_address"))]
             if len(cards) > 1:
@@ -720,7 +910,7 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
                 (max(1, round(ocr_image.width * scale)), max(1, round(ocr_image.height * scale))),
                 Image.Resampling.LANCZOS,
             )
-        text, line_heights = _read_image_with_layout(ocr_image)
+        text, line_heights = _read_card_text(ocr_image)
         return _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(image) + _decode_qr_payloads(ocr_image))
 
 
@@ -735,15 +925,59 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
         for key in ("contact_numbers", "contact_number", "email_addresses", "email", "website"):
             english[key] = fields.get(key)
         source_lines, english_lines = _clean_lines(original_text), _clean_lines(translated)
-        if len(source_lines) == len(english_lines):
-            for key in ("company_name", "owner_name"):
-                value = english.get(key)
-                if value in english_lines:
-                    source = source_lines[english_lines.index(value)]
-                    if re.search(r"[\u0900-\u097f]", source):
-                        rendered = latin_name(source)
-                        english[key] = rendered
-                        english["raw_text"] = str(english["raw_text"]).replace(str(value), str(rendered))
+        for key in ("company_name", "owner_name", "designation", "company_address"):
+            original_value = fields.get(key)
+            translated_value = english.get(key)
+            # A translated value is usable only when it maps back to the same
+            # source line. This prevents a translation/layout change from
+            # moving an address, slogan, or business category into a name field.
+            mapped_source = None
+            if translated_value and len(source_lines) == len(english_lines):
+                target = re.sub(r"\s+", " ", str(translated_value).casefold()).strip()
+                for start in range(len(english_lines)):
+                    for end in range(start + 1, min(len(english_lines), start + 4) + 1):
+                        candidate = re.sub(r"\s+", " ", " ".join(english_lines[start:end]).casefold()).strip()
+                        if candidate == target:
+                            mapped_source = " ".join(source_lines[start:end])
+                            break
+                    if mapped_source:
+                        break
+            has_indic_source = bool(mapped_source and re.search(r"[\u0900-\u097f]", mapped_source))
+            if original_value and not re.search(r"[\u0900-\u097f]", str(original_value)):
+                english[key] = original_value
+            elif original_value and re.search(r"[\u0900-\u097f]", str(original_value)):
+                # A company/person name is an identity, not copy to translate.
+                # Keep a Latin transliteration for it while retaining the exact
+                # original in original_ocr_text.
+                rendered = latin_name(str(original_value)) or ""
+                english[key] = " ".join(word.capitalize() for word in rendered.split())
+                if translated_value and key == "company_name" and has_indic_source:
+                    # Translate business-category words, but keep the leading
+                    # brand token phonetic (for example Anmol, not Priceless).
+                    source_tokens = re.findall(r"[\u0900-\u097f]+", mapped_source or "")
+                    translated_tokens = str(translated_value).split()
+                    if source_tokens and translated_tokens:
+                        brand = latin_name(source_tokens[0]) or translated_tokens[0]
+                        english[key] = " ".join([brand.capitalize(), *translated_tokens[1:]])
+            elif translated_value and has_indic_source:
+                if key == "company_name":
+                    source_tokens = re.findall(r"[\u0900-\u097f]+", mapped_source or "")
+                    translated_tokens = str(translated_value).split()
+                    if not original_value:
+                        english[key] = None
+                    elif source_tokens and translated_tokens:
+                        brand = latin_name(source_tokens[0]) or translated_tokens[0]
+                        english[key] = " ".join([brand.capitalize(), *translated_tokens[1:]])
+                    else:
+                        english[key] = translated_value
+                else:
+                    english[key] = translated_value
+            elif original_value and re.search(r"[\u0900-\u097f]", str(original_value)):
+                english[key] = latin_name(str(original_value))
+            elif translated_value:
+                english[key] = None
+            if english.get(key) != translated_value and translated_value:
+                english["raw_text"] = str(english["raw_text"]).replace(str(translated_value), str(english.get(key) or ""))
         fields = english
         fields["translation_message"] = "Converted to English locally. Names use Latin-letter transliteration; check spelling and every field against the original before saving."
     elif re.search(r"[\u0900-\u097f]", original_text):
@@ -757,10 +991,23 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
             latin_fields = _parse_fields(latin_text, line_heights)
             for key in ("contact_numbers", "contact_number", "email_addresses", "email", "website"):
                 latin_fields[key] = fields.get(key)
+            if not fields.get("company_name"):
+                latin_fields["company_name"] = None
+            if not fields.get("owner_name"):
+                latin_fields["owner_name"] = None
             fields = latin_fields
             fields["translation_message"] = "English translation is unavailable because the model is not installed; the preview uses a Latin-only transliteration/cleaned transcript. Verify names and address before saving."
     fields["original_ocr_text"] = original_text
     fields["translation_status"] = status
+    field_review_warnings = []
+    if not fields.get("company_name"):
+        field_review_warnings.append("Company name was not confidently identified. Enter it after checking the card.")
+    if not fields.get("owner_name"):
+        field_review_warnings.append("Owner/contact name was not confidently identified. Check the original card.")
+    if not fields.get("designation"):
+        field_review_warnings.append("No designation was confidently identified. Confirm whether one is printed on the card.")
+    if field_review_warnings:
+        fields["review_warnings"] = field_review_warnings
     if status == "unavailable" and not fields.get("translation_message"):
         fields["translation_message"] = "English translation is unavailable or incomplete. Retry after configuring the local translation model, or enter English values manually before saving. The original OCR text is preserved."
     return fields
