@@ -1,5 +1,6 @@
 import re
 import os
+import shutil
 import subprocess
 import tempfile
 import unicodedata
@@ -11,8 +12,19 @@ from PIL import Image, ImageChops, ImageEnhance, ImageOps
 from .translation import translate_document_text, latin_name
 
 
-if os.getenv("TESSERACT_CMD"):
-    pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
+configured_tesseract = os.getenv("TESSERACT_CMD", "").strip()
+if configured_tesseract:
+    # Ignore machine-specific paths copied from a local .env (for example a
+    # Windows .exe path on a Linux deployment) and use the server PATH instead.
+    configured_path = Path(configured_tesseract)
+    if configured_path.is_file() or shutil.which(configured_tesseract):
+        pytesseract.pytesseract.tesseract_cmd = configured_tesseract
+
+configured_tessdata = os.getenv("TESSDATA_PREFIX", "").strip()
+if configured_tessdata and not Path(configured_tessdata).exists():
+    # Tesseract can use its platform default tessdata directory. An invalid
+    # local path makes an otherwise installed server engine look unavailable.
+    os.environ.pop("TESSDATA_PREFIX", None)
 
 
 class OCRUnavailableError(RuntimeError):
