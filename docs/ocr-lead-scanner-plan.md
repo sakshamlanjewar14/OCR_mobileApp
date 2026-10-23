@@ -79,6 +79,8 @@ The scan queue is available as a compact action on the lead workspace and as a d
 
 Run against a local PostgreSQL database configured in ignored `backend/.env`; run FastAPI and Vite separately. No Docker is required. Tesseract is used when installed; Windows can use its built-in OCR runtime as a fallback. Camera access requires browser support and permission, typically on localhost or HTTPS.
 
+For a hosted backend, use `backend/Dockerfile` so the server installs the Tesseract executable and `eng`, `hin`, and `mar` language data. Configure hosted PostgreSQL and frontend-origin CORS values on the server; local Windows OCR and model paths are not valid in deployment. The M2M100 translation model remains an optional separate server installation.
+
 This is a single-user local MVP without sign-in. Keep the API and source files off public networks. Avoid adding SaaS tenancy, enrichment, CRM integrations, team permissions, workflows, dashboards, or public share links until the basic lead flow is validated.
 
 ## Current status (2026-10-17)

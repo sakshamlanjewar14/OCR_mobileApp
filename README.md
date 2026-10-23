@@ -58,6 +58,10 @@ npm run dev -- --host 127.0.0.1
 
 Open http://localhost:5173. API documentation is available at http://localhost:8000/docs.
 
+### Render backend deployment
+
+The backend includes `backend/Dockerfile` for hosts that need the system Tesseract executable. Deploy it as a Docker web service with `backend/` as the root directory. The image installs English, Hindi, and Marathi Tesseract data; the local translation model remains optional and must be installed separately if English translation is required. Set `DATABASE_URL` to the hosted PostgreSQL URL and `CORS_ORIGINS` to the deployed frontend origin. Do not use the local Windows `TESSERACT_CMD`, `TESSDATA_PREFIX`, or `TRANSLATION_MODEL_DIR` paths on a server.
+
 If port 8000 is already used by another local application, run this app's API on port 8001 and set `VITE_API_URL=http://127.0.0.1:8001/api` in `frontend/.env.local`, then restart Vite. The API's local CORS defaults allow Vite ports 5173 through 5176 on `localhost` and `127.0.0.1`; keep any custom frontend port in `CORS_ORIGINS` or browser requests will fail even when the API is healthy. Keep the frontend API URL pointed to this app's API; a different service on port 8000 can also cause upload requests to fail.
 
 ## Mobile app setup
