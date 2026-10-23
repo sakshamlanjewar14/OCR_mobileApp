@@ -813,7 +813,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     ))
     emails = list(dict.fromkeys(labeled_emails + email_addresses))
     explicit_address = ", ".join(explicit.get("company_address", [])).strip()
-    return {
+    parsed = {
         "company_name": (explicit.get("company_name") or [company])[0],
         "owner_name": (explicit.get("owner_name") or [owner])[0],
         "designation": (explicit.get("designation") or [designation])[0],
@@ -835,6 +835,34 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         "registration_number": (explicit.get("registration_number") or [None])[0],
         "raw_text": _format_labeled_text(text),
     }
+    # Stock business-card mockups print sample values that look like real
+    # contacts (Lorem Ipsum, NAME SURNAME, sitename.domain, sample address).
+    # Keep the transcript for verification, but never expose those values as
+    # a lead preview. Two independent template markers are required so a
+    # legitimate card with one unusual phrase is not suppressed.
+    template_markers = (
+        r"\blorem\s+ips\w*\b",
+        r"\bname\s+surname\b",
+        r"\bbusiness\s+company\b",
+        r"\bsitename\.domain\b",
+        r"\b123\s+address\s+avenue\b",
+        r"\bsample\s+city\b",
+        r"\blorem@ipsum\.com\b",
+    )
+    if sum(bool(re.search(marker, text, re.I)) for marker in template_markers) >= 2:
+        for key in (
+            "company_name", "owner_name", "designation", "company_address",
+            "contact_number", "contact_numbers", "email", "email_addresses",
+            "website", "telephone_numbers", "fax_numbers", "facebook_link",
+            "instagram_link", "whatsapp_link", "city", "state", "pincode",
+            "gst_number", "registration_number",
+        ):
+            parsed[key] = [] if key in {"contact_numbers", "email_addresses", "telephone_numbers", "fax_numbers"} else None
+        parsed["template_detected"] = True
+        parsed["review_warnings"] = [
+            "This image appears to be a business-card template with placeholder details. No lead fields were filled; verify with a real card."
+        ]
+    return parsed
 
 
 def _decode_qr_payloads(image: Image.Image) -> list[str]:
@@ -1000,7 +1028,7 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
             fields["translation_message"] = "English translation is unavailable because the model is not installed; the preview uses a Latin-only transliteration/cleaned transcript. Verify names and address before saving."
     fields["original_ocr_text"] = original_text
     fields["translation_status"] = status
-    field_review_warnings = []
+    field_review_warnings = list(fields.get("review_warnings") or [])
     if not fields.get("company_name"):
         field_review_warnings.append("Company name was not confidently identified. Enter it after checking the card.")
     if not fields.get("owner_name"):

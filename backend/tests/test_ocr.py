@@ -169,6 +169,31 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertIsNone(fields["owner_name"])
         self.assertIsNone(fields["designation"])
 
+    def test_stock_card_template_placeholders_never_become_lead_data(self) -> None:
+        source = (
+            "ELECTRONIC\nBUSINESS COMPANY\nLorem Ipsum dolorem stratia\n"
+            "NAME SURNAME\nCreative director\n+123 456 7890\n"
+            "lorem@ipsum.com\nsitename.domain\n123 Address Avenue\n"
+            "Sample City, 45678, Country Land\nID 160982199 © Serkorkin"
+        )
+
+        fields = _parse_fields(source)
+        self.assertIsNone(fields["company_name"])
+        self.assertIsNone(fields["owner_name"])
+        self.assertIsNone(fields["designation"])
+        self.assertIsNone(fields["company_address"])
+        self.assertEqual(fields["contact_numbers"], [])
+        self.assertEqual(fields["email_addresses"], [])
+        self.assertIsNone(fields["website"])
+        self.assertTrue(fields["template_detected"])
+        self.assertIn("BUSINESS COMPANY", fields["raw_text"])
+
+        from backend.app.ocr import _fields_from_ocr_text
+        with patch("backend.app.ocr.translate_document_text", return_value=(None, "not_required")):
+            preview = _fields_from_ocr_text(source)
+        self.assertIn("placeholder details", preview["review_warnings"][0])
+        self.assertEqual(preview["original_ocr_text"], source)
+
     def test_foundation_card_keeps_company_person_title_contacts_and_address_separate(self) -> None:
         fields = _parse_fields(
             "Hemendra Mhatre\nZonal Mobilisation Manager\nIdeas to Impact Foundation\n"
