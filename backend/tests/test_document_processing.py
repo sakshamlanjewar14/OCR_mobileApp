@@ -70,6 +70,23 @@ class DocumentReviewFlowTests(unittest.TestCase):
             sheet = load_workbook(BytesIO(exported.content))["Leads"]
             self.assertEqual(sheet["C2"].value, "Anmol")
 
+    def test_original_script_in_other_document_text_does_not_block_save(self) -> None:
+        with self.session_factory() as db:
+            saved = main.create_lead(
+                LeadCreate(
+                    company_name="Anmol Boutique",
+                    owner_name="Anmol Verma",
+                    designation="Owner",
+                    raw_text="अनमोल बुटीक\nसभी प्रकार के कपड़े",
+                    original_ocr_text="अनमोल बुटीक\nसभी प्रकार के कपड़े",
+                    document_id="review-document",
+                    source_review_confirmed=True,
+                ),
+                db,
+            )
+            self.assertEqual(saved.raw_text, "अनमोल बुटीक\nसभी प्रकार के कपड़े")
+            self.assertEqual(saved.original_ocr_text, "अनमोल बुटीक\nसभी प्रकार के कपड़े")
+
     def test_ocr_keeps_extracted_fields_as_review_draft(self) -> None:
         extracted_fields = {
             "raw_text": "Acme Solutions Pvt Ltd\nJane Doe\nDirector\n211 Main Road",

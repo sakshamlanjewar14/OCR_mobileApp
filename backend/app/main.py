@@ -621,7 +621,10 @@ def retry_document(document_id: str, background_tasks: BackgroundTasks, db: Sess
 
 
 def _require_english_ocr(values: dict) -> None:
-    fields = ("company_name", "owner_name", "designation", "company_address", "raw_text")
+    # `raw_text` is the source/document transcript and may intentionally keep
+    # the original Hindi or Marathi text. Only structured lead fields must be
+    # Latin-letter values; `original_ocr_text` preserves the untouched source.
+    fields = ("company_name", "owner_name", "designation", "company_address")
     remaining = [key for key in fields if re.search(r"[\u0900-\u097f]", str(values.get(key) or ""))]
     if remaining:
         raise HTTPException(status_code=422, detail="Enter English/Latin-letter values before saving: " + ", ".join(remaining) + ". Re-scan and translate, or correct the preview manually. Original OCR text is kept separately.")
