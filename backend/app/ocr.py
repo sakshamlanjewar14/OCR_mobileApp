@@ -9,7 +9,7 @@ from pathlib import Path
 import pytesseract
 import pymupdf
 from PIL import Image, ImageChops, ImageEnhance, ImageOps
-from .translation import translate_document_text, latin_name
+from .translation import translate_document_text, latin_name, latinize_document_text
 
 
 configured_tesseract = os.getenv("TESSERACT_CMD", "").strip()
@@ -654,8 +654,21 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
                         english["raw_text"] = str(english["raw_text"]).replace(str(value), str(rendered))
         fields = english
         fields["translation_message"] = "Converted to English locally. Names use Latin-letter transliteration; check spelling and every field against the original before saving."
+    elif re.search(r"[\u0900-\u097f]", original_text):
+        # A production server may have Tesseract language data but not the
+        # optional 2 GB translation model. Keep the review usable and prevent
+        # mixed-script values from entering structured fields by using a
+        # Latin-only transcript as a safe fallback. The untouched OCR remains
+        # available in original_ocr_text.
+        latin_text = latinize_document_text(original_text)
+        if latin_text and not re.search(r"[\u0900-\u097f]", latin_text):
+            latin_fields = _parse_fields(latin_text, line_heights)
+            for key in ("contact_numbers", "contact_number", "email_addresses", "email", "website"):
+                latin_fields[key] = fields.get(key)
+            fields = latin_fields
+            fields["translation_message"] = "English translation is unavailable because the model is not installed; the preview uses a Latin-only transliteration/cleaned transcript. Verify names and address before saving."
     fields["original_ocr_text"] = original_text
     fields["translation_status"] = status
-    if status == "unavailable":
+    if status == "unavailable" and not fields.get("translation_message"):
         fields["translation_message"] = "English translation is unavailable or incomplete. Retry after configuring the local translation model, or enter English values manually before saving. The original OCR text is preserved."
     return fields

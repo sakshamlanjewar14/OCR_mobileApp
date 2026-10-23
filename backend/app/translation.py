@@ -27,6 +27,32 @@ def latin_name(text: str | None) -> str | None:
     return unidecode(text).strip()
 
 
+def latinize_document_text(text: str) -> str:
+    """Return a Latin-only review transcript when semantic translation is unavailable.
+
+    OCR often adds isolated Indic glyphs to an otherwise English card. In that
+    common case, discard the isolated glyph-only lines and remove Indic glyphs
+    from mixed lines. For predominantly Indic documents, transliteration keeps
+    the readable content available for review instead of mixing scripts.
+    """
+    if not DEVANAGARI.search(text):
+        return text
+    letters = re.findall(r"[A-Za-z\u0900-\u097f]", text)
+    latin_share = sum(ch.isascii() and ch.isalpha() for ch in letters) / max(1, len(letters))
+    if latin_share >= 0.35:
+        lines: list[str] = []
+        for line in text.splitlines():
+            if DEVANAGARI.search(line):
+                if not re.search(r"[A-Za-z0-9@.+-]", line):
+                    continue
+                line = DEVANAGARI.sub("", line)
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                lines.append(line)
+        return "\n".join(lines)
+    return latin_name(text) or ""
+
+
 @lru_cache(maxsize=1)
 def _load_model():
     configured = os.getenv("TRANSLATION_MODEL_DIR", "").strip()

@@ -51,6 +51,15 @@ class EnglishReviewTests(unittest.TestCase):
         self.assertNotEqual(fields['company_name'], 'Priceless Technologies')
         self.assertEqual(fields['designation'], 'Director')
 
+    def test_unavailable_model_cleans_mixed_script_review_text(self):
+        source = 'SALON PARTNERS\nह शका\nkapil@barbowws.com\nwww.barbowws.com\nPune, India'
+        with patch.object(ocr, 'translate_document_text', return_value=(None, 'unavailable')):
+            fields = ocr._fields_from_ocr_text(source)
+        self.assertNotRegex(fields['raw_text'], r'[\u0900-\u097f]')
+        self.assertEqual(fields['original_ocr_text'], source)
+        self.assertEqual(fields['email_addresses'], ['kapil@barbowws.com'])
+        self.assertEqual(fields['website'], 'www.barbowws.com')
+
     def test_marathi_sentence_uses_marathi_source_language(self):
         with patch.object(translation, '_translate_parts', return_value=['We sell clothes.']) as engine:
             self.assertEqual(translation.translate_document_text('आम्ही कपडे विकतो.')[1], 'translated')

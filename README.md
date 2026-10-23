@@ -94,6 +94,8 @@ The API uses Tesseract when installed, requesting `eng+hin+mar` by default. Inst
 
 Hindi/Marathi OCR uses the free, MIT-licensed local `facebook/m2m100_418M` model for English translation. No card text is sent to an external translation service. Names and recognizable address lines use Latin transliteration to avoid changing their identity or location; spellings require review. The exact original OCR transcript remains separately available. The review page shows conversion status and **Re-scan and translate** for older drafts. Saving OCR leads with remaining Devanagari in structured fields or document text is blocked until corrected; the original transcript is exempt.
 
+When the optional translation model is unavailable on a hosted server, the preview uses a Latin-only fallback: isolated Indic OCR noise is removed from mixed English lines and predominantly Indic lines are transliterated. Structured fields are parsed from that cleaned text, while the untouched OCR remains in the separate original transcript.
+
 Install from the backend directory:
 ```powershell
 .\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
