@@ -748,6 +748,8 @@ async def preview_raw_leads(file: UploadFile = File(...)):
         if suffix == ".txt":
             source = (await file.read()).decode("utf-8-sig")
             fields = _parse_fields(source)
+            fields["original_ocr_text"] = source
+            fields["raw_text"] = source
             return {"filename": filename, "candidates": [{"row": 1, "fields": fields}]}
         if suffix == ".csv":
             source = (await file.read()).decode("utf-8-sig")

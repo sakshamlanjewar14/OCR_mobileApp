@@ -1,4 +1,5 @@
 import os
+import asyncio
 import unittest
 import tempfile
 import zipfile
@@ -14,6 +15,7 @@ from sqlalchemy.pool import StaticPool
 from fastapi import HTTPException
 from starlette.background import BackgroundTasks
 from starlette.requests import Request
+from starlette.datastructures import UploadFile
 from openpyxl import load_workbook
 from PIL import Image
 
@@ -24,6 +26,18 @@ from backend.app.schemas import LeadCreate
 
 
 class DocumentReviewFlowTests(unittest.TestCase):
+    def test_text_preview_preserves_original_and_multiple_contacts_without_company(self):
+        source = 'Contacts\r\n+91 89995 21798\r\n+91 74994 22904\r\nपुणे\r\n'
+        with tempfile.SpooledTemporaryFile() as stream:
+            stream.write(source.encode('utf-8-sig'))
+            stream.seek(0)
+            upload = UploadFile(filename='contacts.txt', file=stream)
+            result = asyncio.run(main.preview_raw_leads(upload))
+        fields = result['candidates'][0]['fields']
+        self.assertEqual(fields['original_ocr_text'], source)
+        self.assertEqual(fields['raw_text'], source)
+        self.assertEqual(fields['contact_numbers'], ['+91 89995 21798', '+91 74994 22904'])
+
     def setUp(self) -> None:
         self.engine = create_engine(
             "sqlite://",

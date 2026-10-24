@@ -8,6 +8,15 @@ The proposed React Native mobile extension and its free-service constraints are 
 
 Capture business cards and company documents, extract useful lead data, let a person verify and correct it, then save and export clean lead records.
 
+## Screenshot and transcript accuracy fix (2026-10-24)
+
+- Extract supported fields from screenshots and text documents even when no company name is present. Multiple contacts must not be discarded simply because the input is not a business card. Saving still follows the existing reviewed-lead requirements.
+- Keep upright portrait input upright. When the first portrait reading has no phone/email evidence, compare bounded sideways reads; do not combine conflicting orientation readings. Preserve full-height contact recovery crops.
+- Deduplicate equivalent Indian phone representations. Do not truncate overlong OCR numbers to manufacture a valid phone; retain source text and request review.
+- Mixed Hindi/Marathi/English text uses transliteration without deleting Indic words or digits. TXT previews retain their exact source separately and in Other Document Text.
+- Local verification with the supplied WhatsApp screenshot recovered all seven visible phone numbers exactly (about 2.6 seconds). The supplied sideways Barbowws card recovered its phone (about 7.1 seconds); its owner name remains uncertain and requires review. These are local sample results, not a production latency guarantee or a universal accuracy score.
+- Validation: 104 backend tests pass, including orientation, screenshot contacts, text preservation, and mixed-script regressions. Frontend production build passes.
+
 ## MVP scope
 
 - React frontend, FastAPI backend, PostgreSQL storage.

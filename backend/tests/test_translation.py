@@ -7,6 +7,14 @@ from backend.app import translation, ocr
 
 
 class EnglishReviewTests(unittest.TestCase):
+    def test_mixed_script_transliteration_preserves_words_digits_and_lines(self):
+        source = 'Example Company\nMobile: ९८७६५४३२१०\nपुणे\nOwner: अमित\n'
+        result = translation.latinize_document_text(source)
+        self.assertIn('9876543210', result)
+        self.assertIn(translation.latin_name('पुणे'), result)
+        self.assertIn(translation.latin_name('अमित'), result)
+        self.assertEqual(result.count('\n'), source.count('\n'))
+
     def test_cpu_translation_model_uses_dynamic_int8_when_available(self):
         optimized_model = object()
         quantize = Mock(return_value=optimized_model)

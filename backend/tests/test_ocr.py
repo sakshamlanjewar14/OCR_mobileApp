@@ -9,6 +9,10 @@ from PIL import Image, ImageDraw
 from backend.app.ocr import _decode_qr_payloads, _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _read_recovery_crops, _split_card_image, extract_fields
 
 
+SCREENSHOT_PHONES = ["+91 89995 21798", "+91 74994 22904", "+91 98604 67728",
+                     "+91 98232 11418", "+91 92701 98052", "+91 91582 21895", "+91 96658 06949"]
+
+
 class OCRLatencyRegressionTests(unittest.TestCase):
     def test_image_scan_reports_non_overlapping_pipeline_timings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +98,42 @@ class CombinedCardImageTests(unittest.TestCase):
 
 
 class LeadFieldParsingTests(unittest.TestCase):
+    def test_screenshot_contacts_are_not_discarded_without_company(self) -> None:
+        text = "WhatsApp\nSearch Chats Calls Updates Tools\nWw Ok\n" + "\n".join(
+            f"{phone} 03/10/2026" for phone in SCREENSHOT_PHONES
+        )
+        fields = _parse_fields(text)
+        self.assertEqual(fields["contact_numbers"], SCREENSHOT_PHONES)
+        self.assertIsNone(fields["company_name"])
+        self.assertIsNone(fields["owner_name"])
+        self.assertIsNone(fields["whatsapp_link"])
+
+    def test_upright_screenshot_does_not_rotate_or_run_card_recovery(self) -> None:
+        image = Image.new("RGB", (716, 1600), "white")
+        text = "WhatsApp\nChats Calls Updates\n" + "\n".join(SCREENSHOT_PHONES)
+        with patch("backend.app.ocr._read_image_with_layout", return_value=(text, {})) as read, \
+             patch("backend.app.ocr._read_recovery_crops") as recover:
+            actual, _ = _read_card_text(image)
+        self.assertEqual(actual, text)
+        read.assert_called_once_with(image)
+        recover.assert_not_called()
+
+    def test_sideways_photo_can_recover_using_orientation_evidence(self) -> None:
+        image = Image.new("RGB", (600, 1000), "white")
+        text = "Acme Industries\nJane Doe\n+91 9876543210\njane@acme.com"
+        with patch("backend.app.ocr._read_image_with_layout", side_effect=[("illegible", {}), (text, {})]) as read:
+            actual, _ = _read_card_text(image)
+        self.assertEqual(actual, text)
+        self.assertEqual(read.call_args.args[0].size, (1000, 600))
+
+    def test_equivalent_indian_phone_formats_are_deduplicated(self) -> None:
+        fields = _parse_fields(
+            "Acme Technologies Pvt Ltd\n"
+            "Mobile: 06769085996\n"
+            "Contact: +91 67690 85996"
+        )
+        self.assertEqual(len(fields["contact_numbers"]), 1)
+
     def test_each_populated_field_has_a_source_line_or_qr_payload(self) -> None:
         result = _merge_qr_fields({
             "company_name": "Acme Systems Pvt Ltd",
@@ -131,6 +171,20 @@ class LeadFieldParsingTests(unittest.TestCase):
     def test_app_download_qr_ocr_fragments_do_not_become_owner_name(self) -> None:
         fields = _parse_fields("SALON PARTNERS\nDownload the App\nJoin as a Partner\nwww.barbowws.com")
         self.assertIsNone(fields["owner_name"])
+
+    def test_app_store_caption_does_not_replace_contact_person(self) -> None:
+        fields = _parse_fields("GET IT ON\nGoogle Play\nKAPIL KADAM\nFounder & CEO\nkapil@barbowws.com\nwww.barbowws.com")
+        self.assertEqual(fields["owner_name"], "KAPIL KADAM")
+
+    def test_contact_recovery_preserves_top_of_card(self) -> None:
+        image = Image.new("RGB", (1000, 600), "white")
+        image.putpixel((0, 0), (0, 0, 0))
+        with patch("backend.app.ocr._uses_windows_ocr_fallback", return_value=False), \
+             patch("backend.app.ocr.pytesseract.image_to_string", return_value="+91 7066336455") as read:
+            _read_recovery_crops(image, contact_details=True)
+        crop = read.call_args.args[0]
+        self.assertEqual(crop.size, (1100, 1200))
+        self.assertLess(crop.getpixel((0, 0)), 100)
 
     def test_ambiguous_uppercase_and_lowercase_ocr_fragments_stay_blank_as_owner(self) -> None:
         for fragment in ("ALARM IGE MAI", "tele ss"):
@@ -457,7 +511,8 @@ class LeadFieldParsingTests(unittest.TestCase):
 
     def test_short_ocr_suffix_is_not_added_to_an_indian_mobile_number(self) -> None:
         fields = _parse_fields("Amit Nalawade\nMarketing Executive\n+91 86558 73467 7-8")
-        self.assertEqual(fields["contact_numbers"], ["+91 86558 73467"])
+        self.assertEqual(fields["contact_numbers"], [])
+        self.assertTrue(any("truncating" in warning for warning in fields["review_warnings"]))
 
     def test_company_line_wins_over_authorised_product_brand_and_pipe_layout(self) -> None:
         fields = _parse_fields(

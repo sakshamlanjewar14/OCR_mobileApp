@@ -77,8 +77,7 @@ def _windows_ocr(image: Image.Image) -> str:
     try:
         best_image = image
         best_text = recognize(image)
-        # extract_fields already rotates portrait phone captures to make the
-        # card landscape. Only retry a portrait page, where a 90-degree turn is
+        # Only retry an unreadable portrait page, where a 90-degree turn is
         # plausible; spawning three more PowerShell processes for every image
         # made a normal scan take several seconds on Windows.
         readable = lambda value: sum(char.isalnum() for char in value)
@@ -231,9 +230,9 @@ def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> l
     width, height = image.size
     ratio = width / max(height, 1)
     if contact_details and ratio > 1.15:
-        # Contact lines sit beneath the name on many cards. A focused crop
-        # avoids spending another full-card pass and reads each line cleanly.
-        boxes = [((0, int(height * 0.40), int(width * 0.62), int(height * 0.92)), "--psm 6", 2.0)]
+        # Keep the entire height: phone lines can be above the email/address.
+        # This supplementary pass must not cut off the top contact block.
+        boxes = [((0, 0, int(width * 0.55), height), "--psm 6", 2.0)]
     elif 0.85 <= ratio <= 1.15:
         # Include both upper brand/title and lower address panels; the previous
         # narrow center crop clipped the brand on square Marathi cards.
@@ -256,6 +255,8 @@ def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> l
     crop_language = os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar")
     for box, config, scale in boxes:
         crop = image.crop(box)
+        if contact_details:
+            crop = ImageOps.grayscale(crop)
         if scale > 1:
             crop = crop.resize((round(crop.width * scale), round(crop.height * scale)), Image.Resampling.LANCZOS)
         if _uses_windows_ocr_fallback():
@@ -275,7 +276,30 @@ def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> l
 
 def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
     text, heights = _read_image_with_layout(image)
+    # Preserve readable upright text. Retry sideways portrait photos only when
+    # the first pass has no usable phone/email evidence, and choose one reading
+    # rather than unioning conflicting digits from different orientations.
+    def identifier_score(value: str) -> int:
+        parsed = _parse_fields(value)
+        return len(parsed.get("contact_numbers") or []) + 2 * len(parsed.get("email_addresses") or [])
+
+    if image.height > image.width * 1.25 and identifier_score(text) == 0:
+        best_score = 0
+        original_image = image
+        for angle in (90, 270):
+            candidate = original_image.rotate(angle, expand=True)
+            candidate_text, candidate_heights = _read_image_with_layout(candidate)
+            score = identifier_score(candidate_text)
+            if score > best_score:
+                image, text, heights = candidate, candidate_text, candidate_heights
+                best_score = score
+            if score >= 3:
+                break
     fields = _parse_fields(text, heights)
+    # Multiple clearly printed contacts are valid input even without a company.
+    # Card-specific recovery crops would fragment a screenshot/contact list.
+    if len(fields.get("contact_numbers") or []) >= 3:
+        return text, heights
     needs_recovery = (
         not fields.get("company_name")
         or not fields.get("owner_name")
@@ -293,8 +317,9 @@ def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
             if recovery.strip():
                 text = _merge_ocr_transcripts(text, recovery)
         recovered_fields = _parse_fields(text, heights)
-        if (not focused_contact_pass and recovered_fields.get("contact_numbers")
-                and not recovered_fields.get("email_addresses") and not recovered_fields.get("website")):
+        if (not focused_contact_pass and (
+                (recovered_fields.get("contact_numbers") and not recovered_fields.get("email_addresses") and not recovered_fields.get("website"))
+                or (recovered_fields.get("email_addresses") and not recovered_fields.get("contact_numbers")))):
             for recovery in _read_recovery_crops(image, contact_details=True):
                 if recovery.strip():
                     text = _merge_ocr_transcripts(text, recovery)
@@ -665,19 +690,21 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
                     email_addresses.append(corrected)
                     recovered_email = True
     contact_numbers: list[str] = []
+    uncertain_phone = False
     phone_pattern = re.compile(r"(?<!\d)\+?\d(?:[ \t().-]*\d){6,14}(?!\d)")
     for line in lines:
         if re.match(r"^\s*fax\b", line, re.I) or re.search(r"(?:https?://|www\.)", line, re.I):
             continue
         contact_line = re.split(r"\b(?:fax|telefax)\b", line, maxsplit=1, flags=re.I)[0]
+        # Dates beside screenshot contacts must not become trailing phone digits.
+        contact_line = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", " | ", contact_line)
         for match in phone_pattern.finditer(contact_line):
             number = re.sub(r"\s+", " ", match.group(0)).strip()
             digits = re.sub(r"\D", "", number)
             if digits.startswith("91") and len(digits) > 12 and digits[2] in "6789":
-                # A nearby OCR artifact such as a short card serial after an
-                # Indian mobile number must not become part of a dial link.
-                digits = digits[:12]
-                number = f"+91 {digits[2:7]} {digits[7:12]}"
+                # Never manufacture a valid-looking number by truncating OCR.
+                uncertain_phone = True
+                continue
             indian_mobile = len(digits) == 10 and digits[0] in "6789"
             country_prefixed_mobile = len(digits) == 12 and digits.startswith("91") and digits[2] in "6789"
             indian_landline = len(digits) in {11, 12} and digits.startswith("0")
@@ -844,7 +871,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         r"join\s+as|download|customers?|book\s+your|check\s+estimated|alert\s+before|waiting\s+time|appointment)\b",
         re.I,
     )
-    non_person_text = re.compile(r"\b(salon|partners?|customers?|download|app|play|appointment|estimated|waiting|boutique|fashion|blouse|saree|services?|seen)\b", re.I)
+    non_person_text = re.compile(r"\b(salon|partners?|customers?|download|app|play|get\s+it\s+on|appointment|estimated|waiting|boutique|fashion|blouse|saree|services?|seen)\b", re.I)
     indic_proprietor = any(re.search(r"प्रो\.?\s*प्रा\.?", line) for line in lines)
     designation = next(
         (
@@ -964,9 +991,28 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     labeled_emails = explicit.get("email_addresses", [])
     # When a card labels mobile/contact numbers, do not pull digits from its
     # telephone, fax, WhatsApp URL, pincode, or registration number into it.
-    contacts = list(dict.fromkeys(
-        labeled_contacts if labeled_contacts else explicit.get("telephone_numbers", []) + contact_numbers
-    ))
+    contact_candidates = labeled_contacts if labeled_contacts else explicit.get("telephone_numbers", []) + contact_numbers
+    contacts: list[str] = []
+    seen_contact_keys: set[str] = set()
+    for value in contact_candidates:
+        digits = re.sub(r"\D", "", str(value))
+        if digits.startswith("91") and len(digits) > 12:
+            uncertain_phone = True
+            continue
+        # OCR can read the same Indian mobile once with a stray leading zero
+        # and once without it. De-duplicate on the normalized mobile identity,
+        # before the save layer adds +91, so the lead list cannot show repeats.
+        if len(digits) == 12 and digits.startswith("91") and digits[2] in "6789":
+            identity = digits[2:]
+        elif len(digits) == 11 and digits.startswith("0") and digits[1] in "6789":
+            identity = digits[1:]
+        elif len(digits) == 14 and digits.startswith("0091") and digits[4] in "6789":
+            identity = digits[4:]
+        else:
+            identity = digits
+        if identity and identity not in seen_contact_keys:
+            contacts.append(str(value).strip())
+            seen_contact_keys.add(identity)
     emails = list(dict.fromkeys(labeled_emails + email_addresses))
     explicit_address = ", ".join(explicit.get("company_address", [])).strip()
     parsed = {
@@ -992,6 +1038,23 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         "registration_number": (explicit.get("registration_number") or [None])[0],
         "raw_text": _format_labeled_text(text),
     }
+    # App navigation is not a person's name or a social contact label. Keep
+    # every extracted contact, but do not associate a chat list with one owner.
+    chat_list = bool(re.search(r"\bwhatsapp\b", text, re.I)) and len(set(
+        re.findall(r"\b(?:chats|calls|updates|tools|search|communities)\b", text.casefold())
+    )) >= 3
+    if chat_list:
+        if not explicit.get("owner_name"):
+            parsed["owner_name"] = None
+        if parsed.get("whatsapp_link") and not re.search(r"(?:wa\.me/|whatsapp\.com/)", str(parsed["whatsapp_link"]), re.I):
+            parsed["whatsapp_link"] = None
+        parsed.setdefault("review_warnings", []).append(
+            "Multiple chat contacts were extracted. Check their association before saving them together as one lead."
+        )
+    if uncertain_phone:
+        parsed.setdefault("review_warnings", []).append(
+            "An ambiguous phone number was left out rather than truncating its digits. Check the original source and enter the correct number."
+        )
     if company_from_domain:
         parsed.setdefault("review_warnings", []).append(
             "Company name is a suggestion from the website domain; verify its spelling and complete registered name."
@@ -1194,9 +1257,8 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
             primary["cards"] = cards
             return _record_processing_times(primary, started, ocr_elapsed_ms)
 
-    # Card photos are frequently portrait-oriented because the phone was held
-    # upright while the physical landscape card was sideways.
-    ocr_image = image.rotate(90, expand=True) if image.height > image.width * 1.25 else image
+    # Aspect ratio is not text orientation: screenshots and documents are often tall.
+    ocr_image = image
     longest_side = max(ocr_image.size)
     if longest_side > 2200:
         scale = 2200 / longest_side
