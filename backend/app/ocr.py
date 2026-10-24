@@ -238,6 +238,12 @@ def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> l
         # Include both upper brand/title and lower address panels; the previous
         # narrow center crop clipped the brand on square Marathi cards.
         boxes = [((int(width * 0.03), int(height * 0.10), int(width * 0.97), int(height * 0.87)), "--psm 6", 1.7)]
+    elif ratio > 1.15:
+        # The two overlapping half-card scans used to run serially and cost
+        # roughly two seconds on a mobile-sized card. A single modestly
+        # enlarged sparse-text pass covers company, person, and contact lines
+        # together, with no crop edge able to cut off a field.
+        boxes = [((0, 0, width, height), "--psm 11", 1.25)]
     else:
         boxes = [
             # The contact/name panel on many cards occupies the left half. A

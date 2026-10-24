@@ -110,6 +110,8 @@ This is a single-user local MVP without sign-in. Keep the API and source files o
 
 ## Change log
 
+- 2026-10-23: Reduced serial OCR fallback work for landscape cards to one full-card sparse-text pass instead of two enlarged partial crops. On the supplied SM Electricals sample, local scan time fell from about 3.6 seconds to 2.1 seconds and the recovery pass returned more transcript text plus both phone numbers. Added a regression test for the single-pass path.
+- 2026-10-23: Optimized live-camera photos before upload to a 2200-pixel maximum edge at high JPEG quality, matching the backend OCR input limit and reducing unnecessary cellular upload bytes while keeping the complete card available in source preview.
 - 2026-10-22: Installed Tesseract 5.4.0 through the UB-Mannheim Windows package and configured official English/Hindi/Marathi `tessdata_fast` files in an ignored local runtime folder. Updated local OCR environment settings and documented installation verification. Hindi card recognition produced 58 Devanagari characters; full field extraction still needs review and its phone number was missed. A synthetic Marathi recognition check passed. IndicTrans2 translation was not installed as part of the OCR installation.
 
 - 2026-10-17: Expanded the original review-first MVP with folder/ZIP/multi-file uploads, TXT/CSV/XLSX previews, sequential candidate review, live camera capture, +91 mobile normalization, and bold highlighted XLSX headers. No automatic saving added.

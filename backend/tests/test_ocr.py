@@ -8,14 +8,16 @@ from backend.app.ocr import _decode_qr_payloads, _merge_ocr_transcripts, _merge_
 
 
 class OCRLatencyRegressionTests(unittest.TestCase):
-    def test_recovery_crops_keep_hindi_and_marathi_language_models_for_landscape_cards(self) -> None:
+    def test_landscape_recovery_uses_one_full_card_pass_with_indic_languages(self) -> None:
         image = Image.new("RGB", (900, 500), "white")
         with patch.dict("os.environ", {"TESSERACT_LANGUAGES": "eng+hin+mar"}), \
              patch("backend.app.ocr._uses_windows_ocr_fallback", return_value=False), \
              patch("backend.app.ocr.pytesseract.image_to_string", return_value="कंपनी") as recognize:
-            _read_recovery_crops(image)
-        self.assertEqual(recognize.call_count, 2)
+            results = _read_recovery_crops(image)
+        self.assertEqual(results, ["कंपनी"])
+        self.assertEqual(recognize.call_count, 1)
         self.assertEqual({call.kwargs["lang"] for call in recognize.call_args_list}, {"eng+hin+mar"})
+        self.assertEqual(recognize.call_args.kwargs["config"], "--psm 11")
 
     def test_qr_decoder_upscales_small_printed_codes(self) -> None:
         import cv2

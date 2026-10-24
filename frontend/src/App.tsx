@@ -76,6 +76,28 @@ type RawPreviewResult = { filename: string; candidates: { row: number; fields: E
 type LeadPage = { leads: Lead[]; total: number; page: number; page_size: number };
 const LEADS_PAGE_SIZE = 50;
 
+async function optimizeCameraPhoto(blob: Blob): Promise<Blob> {
+  if (typeof createImageBitmap !== "function") return blob;
+  const bitmap = await createImageBitmap(blob);
+  try {
+    // The backend OCR pipeline already caps images at 2200 px. Sending an
+    // 8–12 MP phone photo over cellular only adds upload time without giving
+    // OCR more pixels to read, so retain that effective resolution at high
+    // JPEG quality before upload.
+    const scale = Math.min(1, 2200 / Math.max(bitmap.width, bitmap.height));
+    const canvas = window.document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) return blob;
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const optimized = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
+    return optimized && optimized.size < blob.size ? optimized : blob;
+  } finally {
+    bitmap.close();
+  }
+}
+
 function mergeExtractedFields(records: DocumentRecord[]): ExtractedLeadFields {
   const merged: ExtractedLeadFields = {};
   for (const key of ["company_name", "owner_name", "designation", "business_description", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
@@ -682,6 +704,7 @@ function App() {
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
         blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.98));
       }
+      if (blob) blob = await optimizeCameraPhoto(blob);
     } catch {
       setCameraError("Could not capture the photo. Keep the card steady and try again.");
       return;
