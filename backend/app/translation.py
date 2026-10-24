@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 DEVANAGARI = re.compile(r"[\u0900-\u097f]")
 PROTECTED = re.compile(r"([\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|(?:https?://|www\.)\S+|\+?\d[\d ()./-]*\d|\d+)")
 _lock = threading.Lock()
+_MODEL_INIT_MS = 0
 
 
 def indic_language(text: str) -> str | None:
@@ -53,8 +55,25 @@ def latinize_document_text(text: str) -> str:
     return latin_name(text) or ""
 
 
+def _quantize_cpu_model(torch, model):
+    """Use INT8 CPU linear layers when the runtime supports them."""
+    engines = getattr(getattr(torch.backends, "quantized", None), "supported_engines", ())
+    if not any(engine in engines for engine in ("fbgemm", "qnnpack")):
+        return model
+    try:
+        return torch.ao.quantization.quantize_dynamic(
+            model, {torch.nn.Linear}, dtype=torch.qint8
+        )
+    except Exception:
+        # Keep translation available on PyTorch builds whose CPU backend does
+        # not support dynamic quantization for this model architecture.
+        return model
+
+
 @lru_cache(maxsize=1)
 def _load_model():
+    global _MODEL_INIT_MS
+    started = time.perf_counter()
     configured = os.getenv("TRANSLATION_MODEL_DIR", "").strip()
     if not configured or not Path(configured).is_dir():
         raise RuntimeError("Local translation model is not configured")
@@ -63,8 +82,15 @@ def _load_model():
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
     tokenizer = M2M100Tokenizer.from_pretrained(configured, local_files_only=True)
     model = M2M100ForConditionalGeneration.from_pretrained(configured, local_files_only=True)
+    model = _quantize_cpu_model(torch, model)
     model.eval()
+    _MODEL_INIT_MS = round((time.perf_counter() - started) * 1000)
     return torch, tokenizer, model
+
+
+def model_initialization_time_ms() -> int:
+    """Return the model load/quantization time for this process, if loaded."""
+    return _MODEL_INIT_MS
 
 
 def warm_translation_model() -> None:

@@ -1,11 +1,35 @@
 import re
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from backend.app import translation, ocr
 
 
 class EnglishReviewTests(unittest.TestCase):
+    def test_cpu_translation_model_uses_dynamic_int8_when_available(self):
+        optimized_model = object()
+        quantize = Mock(return_value=optimized_model)
+        torch = SimpleNamespace(
+            backends=SimpleNamespace(quantized=SimpleNamespace(supported_engines=["fbgemm"])),
+            ao=SimpleNamespace(quantization=SimpleNamespace(quantize_dynamic=quantize)),
+            nn=SimpleNamespace(Linear=object),
+            qint8="qint8",
+        )
+        model = object()
+
+        result = translation._quantize_cpu_model(torch, model)
+
+        self.assertIs(result, optimized_model)
+        quantize.assert_called_once_with(model, {object}, dtype="qint8")
+
+    def test_cpu_translation_model_keeps_full_precision_without_quant_backend(self):
+        model = object()
+        torch = SimpleNamespace(
+            backends=SimpleNamespace(quantized=SimpleNamespace(supported_engines=["none"])),
+        )
+        self.assertIs(translation._quantize_cpu_model(torch, model), model)
+
     def test_address_names_are_transliterated_without_model_guessing(self):
         with patch.object(translation, '_translate_parts', return_value=[]) as engine:
             output, status = translation.translate_document_text('पत्ता: पुणे महाराष्ट्र 411001\n')

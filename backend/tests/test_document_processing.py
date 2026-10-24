@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from fastapi import HTTPException
 from openpyxl import load_workbook
+from PIL import Image
 
 from backend.app import main
 from backend.app.database import Base
@@ -432,9 +433,13 @@ class DocumentReviewFlowTests(unittest.TestCase):
     def test_zip_creates_one_pending_document_per_supported_card_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             archive_bytes = BytesIO()
+            png = BytesIO()
+            Image.new("RGB", (2, 2), "white").save(png, format="PNG")
+            jpeg = BytesIO()
+            Image.new("RGB", (2, 2), "white").save(jpeg, format="JPEG")
             with zipfile.ZipFile(archive_bytes, "w") as archive:
-                archive.writestr("cards/first.png", b"\x89PNG\r\n\x1a\nfirst")
-                archive.writestr("cards/second.jpg", b"\xff\xd8\xffsecond")
+                archive.writestr("cards/first.png", png.getvalue())
+                archive.writestr("cards/second.jpg", jpeg.getvalue())
                 archive.writestr("notes.txt", "skip")
             archive_bytes.seek(0)
             with self.session_factory() as db, patch.object(main, "UPLOAD_DIR", Path(temporary_directory)):

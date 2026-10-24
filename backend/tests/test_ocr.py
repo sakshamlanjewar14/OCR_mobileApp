@@ -1,13 +1,31 @@
 import unittest
 import re
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from backend.app.ocr import _decode_qr_payloads, _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _read_recovery_crops, _split_card_image
+from backend.app.ocr import _decode_qr_payloads, _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _read_recovery_crops, _split_card_image, extract_fields
 
 
 class OCRLatencyRegressionTests(unittest.TestCase):
+    def test_image_scan_reports_non_overlapping_pipeline_timings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "card.png"
+            Image.new("RGB", (800, 400), "white").save(path)
+            with patch("backend.app.ocr._read_card_text", return_value=(
+                "Acme Industries Inc\n+1 415 555 1212\nhello@acme.com", {}
+            )), patch("backend.app.ocr._decode_qr_payloads", return_value=[]) as decode_qr:
+                fields = extract_fields(path, "image/png")
+
+        timings = fields["processing_times_ms"]
+        for key in ("decode_ms", "preprocess_ms", "ocr_ms", "translation_ms", "translation_model_init_ms", "translation_inference_ms", "field_extraction_ms", "qr_ms", "total_ms"):
+            self.assertIn(key, timings)
+        self.assertEqual(fields["company_name"], "Acme Industries Inc")
+        self.assertEqual(fields["email_addresses"], ["hello@acme.com"])
+        decode_qr.assert_called_once()
+
     def test_landscape_recovery_uses_one_full_card_pass_with_indic_languages(self) -> None:
         image = Image.new("RGB", (900, 500), "white")
         with patch.dict("os.environ", {"TESSERACT_LANGUAGES": "eng+hin+mar"}), \

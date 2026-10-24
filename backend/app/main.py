@@ -3,15 +3,17 @@ import io
 import json
 import os
 import re
-import shutil
+import logging
 import textwrap
 import threading
+import time
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl import Workbook, load_workbook
@@ -19,6 +21,12 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from sqlalchemy import func, inspect, or_, select, text
 from sqlalchemy.orm import Session
+from PIL import Image, UnidentifiedImageError
+
+try:
+    import resource
+except ImportError:  # resource is unavailable on Windows development hosts.
+    resource = None
 
 from .database import Base, SessionLocal, engine, get_db
 from .models import Document, Lead, LeadContact, LeadSourceImage
@@ -30,6 +38,15 @@ from .translation import warm_translation_model
 
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads")).resolve()
+MAX_UPLOAD_BYTES = max(1, int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))))
+MAX_BATCH_BYTES = max(MAX_UPLOAD_BYTES, int(os.getenv("MAX_BATCH_BYTES", str(30 * 1024 * 1024))))
+MAX_IMAGE_PIXELS = max(1, int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000))))
+MAX_PDF_PAGES = max(1, int(os.getenv("MAX_PDF_PAGES", "5")))
+MAX_OCR_CONCURRENCY = max(1, int(os.getenv("MAX_OCR_CONCURRENCY", "1")))
+_ocr_slots = threading.BoundedSemaphore(MAX_OCR_CONCURRENCY)
+_active_ocr_jobs = 0
+_active_ocr_lock = threading.Lock()
+logger = logging.getLogger("lead_gennie.request")
 ALLOWED_TYPES = {
     "image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff", "image/gif", "application/pdf",
 }
@@ -51,7 +68,32 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "Server-Timing"],
 )
+
+
+@app.middleware("http")
+async def measure_request(request, call_next):
+    # Accept only UUID-shaped caller IDs; otherwise generate one. Logs contain
+    # no request body, card text, filenames, or contact details.
+    supplied_id = request.headers.get("x-request-id", "")
+    try:
+        request_id = str(uuid.UUID(supplied_id))
+    except (ValueError, AttributeError):
+        request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        response.headers["Server-Timing"] = f"app;dur={(time.perf_counter() - started) * 1000:.1f}"
+        return response
+    finally:
+        logger.info("request_complete request_id=%s method=%s path=%s status=%s duration_ms=%.1f",
+                    request_id, request.method, request.url.path, status,
+                    (time.perf_counter() - started) * 1000)
 
 
 @app.on_event("startup")
@@ -182,7 +224,21 @@ def _process_document(document_id: str) -> None:
         document.error_message = None
         db.commit()
         try:
+            created_at = document.created_at
+            processing_started_at = datetime.now(timezone.utc)
+            if created_at and created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            queue_ms = max(0, round((processing_started_at - created_at).total_seconds() * 1000)) if created_at else 0
             fields = extract_fields(Path(document.storage_path), document.content_type)
+            timing_targets = fields.get("cards") if isinstance(fields.get("cards"), list) else [fields]
+            for timing_target in timing_targets:
+                if not isinstance(timing_target, dict):
+                    continue
+                processing_times = timing_target.get("processing_times_ms")
+                if not isinstance(processing_times, dict):
+                    processing_times = {}
+                processing_times["queue_ms"] = queue_ms
+                timing_target["processing_times_ms"] = processing_times
             document.extracted_fields = fields
             # OCR results are only candidates. A user must review and save them
             # explicitly so an OCR mismatch cannot silently become a lead.
@@ -261,10 +317,41 @@ def _create_document_from_stream(db: Session, filename: str, stream: BinaryIO) -
     try:
         with path.open("wb") as output:
             output.write(header)
-            shutil.copyfileobj(stream, output)
-    except Exception:
+            total = len(header)
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="File exceeds the configured upload-size limit.")
+                output.write(chunk)
+        if content_type == "application/pdf":
+            import pymupdf
+            with pymupdf.open(path) as pdf:
+                if pdf.is_encrypted or len(pdf) < 1:
+                    raise ValueError("The PDF is encrypted or contains no pages.")
+                if len(pdf) > MAX_PDF_PAGES:
+                    raise HTTPException(status_code=413, detail=f"PDFs may contain at most {MAX_PDF_PAGES} pages.")
+        else:
+            try:
+                with Image.open(path) as image:
+                    if image.width * image.height > MAX_IMAGE_PIXELS:
+                        raise HTTPException(status_code=413, detail="Image dimensions exceed the configured pixel limit.")
+                    if image.format != {
+                        "image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP",
+                        "image/bmp": "BMP", "image/tiff": "TIFF", "image/gif": "GIF",
+                    }[content_type]:
+                        raise ValueError("The file contents do not match the detected image type.")
+                    image.verify()
+            except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+                raise ValueError("The image is corrupted or unsupported.") from exc
+    except HTTPException:
         path.unlink(missing_ok=True)
         raise
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="The uploaded file is corrupted or invalid.") from exc
     document = Document(
         id=document_id,
         original_filename=filename[:255],
@@ -282,6 +369,9 @@ def _documents_from_zip(db: Session, filename: str, stream: BinaryIO) -> list[Do
     stream.seek(0)
     try:
         with zipfile.ZipFile(stream) as archive:
+            entries = [entry for entry in archive.infolist() if not entry.is_dir()]
+            if len(entries) > 25 or sum(entry.file_size for entry in entries) > MAX_BATCH_BYTES:
+                raise HTTPException(status_code=413, detail="ZIP exceeds the configured document-count or expanded-size limit.")
             with db.begin_nested():
                 for entry in archive.infolist():
                     member_name = entry.filename.replace("\\", "/")
@@ -305,9 +395,70 @@ def _documents_from_zip(db: Session, filename: str, stream: BinaryIO) -> list[Do
     return documents
 
 
-def _process_documents(document_ids: list[str]) -> None:
-    for document_id in document_ids:
-        _process_document(document_id)
+def _reserve_ocr_slots(count: int) -> bool:
+    reserved = 0
+    for _ in range(count):
+        if not _ocr_slots.acquire(blocking=False):
+            for _ in range(reserved):
+                _ocr_slots.release()
+            return False
+        reserved += 1
+    return True
+
+
+def _process_document_with_request_id(document_id: str, request_id: str, started: float) -> None:
+    _process_document(document_id)
+    with SessionLocal() as db:
+        document = db.get(Document, document_id)
+        if document and isinstance(document.extracted_fields, dict):
+            fields = dict(document.extracted_fields)
+            fields["request_id"] = request_id
+            targets = fields.get("cards") if isinstance(fields.get("cards"), list) else [fields]
+            for target in targets:
+                if isinstance(target, dict):
+                    target.setdefault("processing_times_ms", {})["request_id"] = request_id
+                    timings = target.get("processing_times_ms", {})
+                    logger.info("ocr_complete request_id=%s duration_ms=%.1f queue_ms=%s decode_ms=%s preprocess_ms=%s ocr_ms=%s translation_ms=%s field_extraction_ms=%s qr_ms=%s",
+                                request_id, (time.perf_counter() - started) * 1000,
+                                timings.get("queue_ms"), timings.get("decode_ms"), timings.get("preprocess_ms"),
+                                timings.get("ocr_ms"), timings.get("translation_ms"),
+                                timings.get("field_extraction_ms"), timings.get("qr_ms"))
+            document.extracted_fields = fields
+            db.commit()
+
+
+def _finish_reserved_job(job, request_id: str) -> None:
+    global _active_ocr_jobs
+    started = time.perf_counter()
+    with _active_ocr_lock:
+        _active_ocr_jobs += 1
+    try:
+        job(started)
+    finally:
+        with _active_ocr_lock:
+            _active_ocr_jobs -= 1
+            active_jobs = _active_ocr_jobs
+        if resource is not None:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            cpu_seconds = usage.ru_utime + usage.ru_stime
+            peak_rss_mb = usage.ru_maxrss / 1024
+        else:
+            cpu_seconds = peak_rss_mb = 0
+        logger.info("ocr_job_complete request_id=%s duration_ms=%.1f active=%s capacity=%s process_cpu_seconds_total=%.2f peak_rss_mb=%s",
+                    request_id, (time.perf_counter() - started) * 1000, active_jobs, MAX_OCR_CONCURRENCY, cpu_seconds,
+                    f"{peak_rss_mb:.1f}" if peak_rss_mb else "unavailable")
+        _ocr_slots.release()
+
+
+def _process_reserved_document(document_id: str, request_id: str) -> None:
+    _finish_reserved_job(lambda started: _process_document_with_request_id(document_id, request_id, started), request_id)
+
+
+def _process_reserved_documents(document_ids: list[str], request_id: str) -> None:
+    def process_batch(started: float) -> None:
+        for document_id in document_ids:
+            _process_document_with_request_id(document_id, request_id, time.perf_counter())
+    _finish_reserved_job(process_batch, request_id)
 
 
 def _normalize_india_phone(value: str) -> str:
@@ -367,6 +518,20 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/ready")
+def readiness() -> dict[str, str]:
+    """Readiness for routing scans; /health remains a cheap process liveness check."""
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        from .ocr import _tesseract_available, _uses_windows_ocr_fallback
+        if not _tesseract_available() and not _uses_windows_ocr_fallback():
+            raise RuntimeError("OCR engine unavailable")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Backend dependencies are not ready.") from exc
+    return {"status": "ready"}
+
+
 @app.post("/api/qr/parse")
 def parse_qr(payload: QRParseRequest):
     """Classify scanned QR data locally; this endpoint never opens its URLs."""
@@ -389,47 +554,84 @@ def resolve_coordinates(payload: ReverseGeocodeRequest):
 
 @app.post("/api/documents", response_model=DocumentRead, status_code=202)
 async def upload_document(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     filename = _safe_filename(file.filename or "upload")
     document = _create_document_from_stream(db, filename, file.file)
-    db.commit()
-    db.refresh(document)
-    background_tasks.add_task(_process_document, document.id)
+    if not _reserve_ocr_slots(1):
+        Path(document.storage_path).unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail="OCR is busy. Wait briefly and retry the scan.", headers={"Retry-After": "3"})
+    try:
+        db.commit()
+        db.refresh(document)
+    except Exception:
+        _ocr_slots.release()
+        Path(document.storage_path).unlink(missing_ok=True)
+        db.rollback()
+        raise
+    background_tasks.add_task(_process_reserved_document, document.id, request.state.request_id)
     return _read_document(document)
 
 
 @app.post("/api/documents/batch", status_code=202)
 async def upload_document_batch(
+    request: Request,
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
 ):
     documents: list[Document] = []
     skipped_files: list[dict[str, str]] = []
+    batch_input_bytes = 0
     for upload in files:
         filename = _safe_filename(upload.filename or "upload")
         try:
+            upload.file.seek(0, os.SEEK_END)
+            upload_size = upload.file.tell()
+            upload.file.seek(0)
+            upload_limit = MAX_BATCH_BYTES if Path(filename).suffix.lower() == ".zip" else MAX_UPLOAD_BYTES
+            if upload_size > upload_limit:
+                raise HTTPException(status_code=413, detail="File exceeds the configured upload-size limit.")
+            batch_input_bytes += upload_size
+            if batch_input_bytes > MAX_BATCH_BYTES:
+                raise HTTPException(status_code=413, detail="Batch exceeds the configured total upload-size limit.")
             if Path(filename).suffix.lower() == ".zip":
                 documents.extend(_documents_from_zip(db, filename, upload.file))
             else:
                 documents.append(_create_document_from_stream(db, filename, upload.file))
         except HTTPException as exc:
+            if exc.status_code == 413 and "Batch exceeds" in str(exc.detail):
+                for document in documents:
+                    Path(document.storage_path).unlink(missing_ok=True)
+                db.rollback()
+                raise
             skipped_files.append({"filename": filename, "reason": str(exc.detail)})
     if not documents:
         raise HTTPException(status_code=415, detail="No supported image or PDF documents were found.")
+    if len(documents) > 25:
+        for document in documents:
+            Path(document.storage_path).unlink(missing_ok=True)
+        db.rollback()
+        raise HTTPException(status_code=413, detail="A batch may contain at most 25 documents.")
+    if not _reserve_ocr_slots(1):
+        for document in documents:
+            Path(document.storage_path).unlink(missing_ok=True)
+        db.rollback()
+        raise HTTPException(status_code=503, detail="OCR is busy. Retry this batch shortly.", headers={"Retry-After": "3"})
     try:
         db.commit()
         for document in documents:
             db.refresh(document)
     except Exception:
+        _ocr_slots.release()
         db.rollback()
         for document in documents:
             Path(document.storage_path).unlink(missing_ok=True)
         raise
-    background_tasks.add_task(_process_documents, [document.id for document in documents])
+    background_tasks.add_task(_process_reserved_documents, [document.id for document in documents], request.state.request_id)
     return {"documents": [_read_document(document) for document in documents], "skipped_files": skipped_files}
 
 
@@ -620,15 +822,22 @@ def get_document_file(document_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/api/documents/{document_id}/retry", response_model=DocumentRead, status_code=202)
-def retry_document(document_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def retry_document(document_id: str, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     document = db.get(Document, document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found.")
+    if not _reserve_ocr_slots(1):
+        raise HTTPException(status_code=503, detail="OCR is busy. Wait briefly and retry the scan.", headers={"Retry-After": "3"})
     document.processing_status = "uploaded"
     document.error_message = None
-    db.commit()
-    db.refresh(document)
-    background_tasks.add_task(_process_document, document_id)
+    try:
+        db.commit()
+        db.refresh(document)
+    except Exception:
+        _ocr_slots.release()
+        db.rollback()
+        raise
+    background_tasks.add_task(_process_reserved_document, document_id, request.state.request_id)
     return _read_document(document)
 
 

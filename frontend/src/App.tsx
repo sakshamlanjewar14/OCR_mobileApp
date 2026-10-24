@@ -56,7 +56,7 @@ type ExtractedLeadFields = Omit<Partial<Record<keyof LeadForm, string | null>>, 
   qr_payloads?: string[];
   qr_data?: Record<string, unknown>[];
   field_sources?: Record<string, { source_type: string; source_text: string; confidence: string }>;
-  processing_times_ms?: { ocr_ms?: number; translation_ms?: number; total_ms?: number };
+  processing_times_ms?: { ocr_ms?: number; translation_ms?: number; translation_model_init_ms?: number; translation_inference_ms?: number; field_extraction_ms?: number; decode_ms?: number; preprocess_ms?: number; qr_ms?: number; queue_ms?: number; total_ms?: number };
 };
 type DocumentRecord = {
   id: string;
@@ -77,8 +77,14 @@ type LeadPage = { leads: Lead[]; total: number; page: number; page_size: number 
 const LEADS_PAGE_SIZE = 50;
 
 async function optimizeCameraPhoto(blob: Blob): Promise<Blob> {
+  if (blob.size <= 1_000_000) return blob;
   if (typeof createImageBitmap !== "function") return blob;
-  const bitmap = await createImageBitmap(blob);
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(blob);
+  } catch {
+    return blob;
+  }
   try {
     // The backend OCR pipeline already caps images at 2200 px. Sending an
     // 8–12 MP phone photo over cellular only adds upload time without giving
@@ -361,7 +367,15 @@ function reviewMismatches(form: LeadForm): string[] {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, init);
+  const headers = new Headers(init?.headers);
+  if (!headers.has("X-Request-ID")) {
+    const requestId = crypto.randomUUID?.() || "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (digit) => {
+      const random = Math.random() * 16 | 0;
+      return (digit === "x" ? random : (random & 0x3 | 0x8)).toString(16);
+    });
+    headers.set("X-Request-ID", requestId);
+  }
+  const response = await fetch(`${API}${path}`, { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${response.status})`);
@@ -401,8 +415,15 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [scanStage, setScanStage] = useState("");
+  const [clientScanTiming, setClientScanTiming] = useState<{ documentId: string; prepareMs: number; uploadMs: number; totalMs: number } | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const scanSubmissionRef = useRef(false);
+  const scanStartedAtRef = useRef(0);
+  const scanPreparationMsRef = useRef(0);
+  const scanUploadMsRef = useRef(0);
+  const cameraPreparationMsRef = useRef(0);
 
   const loadLeads = useCallback(async (requestedPage = leadPage) => {
     try {
@@ -487,6 +508,9 @@ function App() {
 
   useEffect(() => {
     if (!pendingDocuments.some((item) => ["uploaded", "processing"].includes(item.processing_status))) return;
+    setScanStage(pendingDocuments.some((item) => item.processing_status === "processing")
+      ? "Reading card and extracting details"
+      : "Waiting for the scanner");
     const timer = window.setTimeout(async () => {
       try {
         const statuses = await api<DocumentStatus[]>("/documents/status", {
@@ -509,6 +533,13 @@ function App() {
         } else {
           setPendingDocuments([]);
           setBusy(false);
+          setScanStage("");
+          scanSubmissionRef.current = false;
+          if (scanStartedAtRef.current) {
+            const timingDocumentId = document?.id || pendingDocuments[0]?.id;
+            if (timingDocumentId) setClientScanTiming({ documentId: timingDocumentId, prepareMs: scanPreparationMsRef.current, uploadMs: scanUploadMsRef.current, totalMs: Math.round(performance.now() - scanStartedAtRef.current) });
+            scanStartedAtRef.current = 0;
+          }
           const completed = updated.find((item) => (!reviewBatchIds.length || reviewBatchIds.includes(item.id)) && (item.processing_status === "needs_review" || item.processing_status === "failed"));
           if (completed && !rawCandidates.length && (!document || document.id === completed.id)) {
             try {
@@ -555,8 +586,9 @@ function App() {
     if (files.length) await uploadFiles(files);
   }
 
-  async function uploadFiles(files: File[], asOneLead = false) {
+  async function uploadFiles(files: File[], asOneLead = false, cameraFilesAlreadyOptimized = false) {
     if (!files.length) return;
+    if (scanSubmissionRef.current) return;
     setError("");
     setNotice("");
     setBusy(true);
@@ -600,15 +632,43 @@ function App() {
         }
       }
       if (!documentFiles.length && !rawFiles.length) throw new Error("Choose card images, PDF, ZIP, TXT, CSV, or XLSX files.");
+        const imageFiles = documentFiles.filter((file) => /^(?:image\/(?:jpeg|png|webp|bmp))$/i.test(file.type) || /\.(jpe?g|png|webp|bmp)$/i.test(file.name));
+      const otherDocuments = documentFiles.filter((file) => !imageFiles.includes(file));
+      let preparedFiles = documentFiles;
+      if (documentFiles.length) {
+        scanSubmissionRef.current = true;
+        scanStartedAtRef.current = performance.now();
+        scanPreparationMsRef.current = cameraFilesAlreadyOptimized ? cameraPreparationMsRef.current : 0;
+        cameraPreparationMsRef.current = 0;
+        scanUploadMsRef.current = 0;
+        setClientScanTiming(null);
+        setScanStage("Preparing image");
+        const preparationStartedAt = performance.now();
+        const preparedImages = cameraFilesAlreadyOptimized ? imageFiles : await Promise.all(imageFiles.map(async (file) => {
+          try {
+            const optimized = await optimizeCameraPhoto(file);
+            return optimized === file ? file : new File([optimized], file.name.replace(/\.[^.]+$/, ".jpg"), { type: optimized.type || "image/jpeg", lastModified: file.lastModified });
+          } catch {
+            // An unsupported decoder must not prevent the original image from
+            // being scanned by the backend.
+            return file;
+          }
+        }));
+        scanPreparationMsRef.current += Math.round(performance.now() - preparationStartedAt);
+        preparedFiles = [...preparedImages, ...otherDocuments];
+      }
       const uploadedDocuments: DocumentRecord[] = [];
       const skippedFiles: string[] = [];
-      for (let start = 0; start < documentFiles.length; start += 20) {
+      if (documentFiles.length) setScanStage("Uploading image");
+      const uploadStartedAt = performance.now();
+      for (let start = 0; start < preparedFiles.length; start += 20) {
         const data = new FormData();
-        documentFiles.slice(start, start + 20).forEach((file) => data.append("files", file));
+        preparedFiles.slice(start, start + 20).forEach((file) => data.append("files", file));
         const result = await api<DocumentBatchResult>("/documents/batch", { method: "POST", body: data });
         uploadedDocuments.push(...result.documents);
         skippedFiles.push(...result.skipped_files.map((item) => `${item.filename}: ${item.reason}`));
       }
+      scanUploadMsRef.current = Math.round(performance.now() - uploadStartedAt);
       if (!rawFiles.length) setDocument(uploadedDocuments[0] || null);
       setActiveCardIndex(0);
       setPendingDocuments(uploadedDocuments);
@@ -620,10 +680,18 @@ function App() {
         setTab("form");
       }
       if (uploadedDocuments.length) setNotice(`${uploadedDocuments.length} document${uploadedDocuments.length === 1 ? "" : "s"} queued. OCR results will open for review and are saved only when you confirm each lead.`);
-      if (!uploadedDocuments.length) setBusy(false);
+      if (!uploadedDocuments.length) {
+        setBusy(false);
+        scanSubmissionRef.current = false;
+        scanStartedAtRef.current = 0;
+        setScanStage("");
+      }
       if (unsupportedCount || skippedFiles.length) setError([...skippedFiles, ...(unsupportedCount ? [`${unsupportedCount} unsupported file${unsupportedCount === 1 ? " was" : "s were"} skipped`] : [])].join("\n"));
     } catch (err) {
       setBusy(false);
+      setScanStage("");
+      scanSubmissionRef.current = false;
+      scanStartedAtRef.current = 0;
       setError(err instanceof Error ? err.message : "Upload failed.");
     }
   }
@@ -684,6 +752,7 @@ function App() {
       return;
     }
     let blob: Blob | null = null;
+    const captureStartedAt = performance.now();
     try {
       const track = cameraStreamRef.current?.getVideoTracks()[0];
       const ImageCaptureApi = window.ImageCapture;
@@ -713,6 +782,7 @@ function App() {
       setCameraError("Could not capture the photo. Try again or upload an image.");
       return;
     }
+    cameraPreparationMsRef.current += Math.round(performance.now() - captureStartedAt);
     setCameraFiles((current) => [...current, new File([blob], `camera-${Date.now()}.jpg`, { type: "image/jpeg" })]);
     setCameraError("");
   }
@@ -725,10 +795,17 @@ function App() {
     setCameraOpen(false);
     const files = cameraFiles;
     setCameraFiles([]);
-    await uploadFiles(files, files.length > 1);
+    await uploadFiles(files, files.length > 1, true);
   }
 
   async function retryDocument(source: DocumentRecord) {
+    if (scanSubmissionRef.current) return;
+    scanSubmissionRef.current = true;
+    scanStartedAtRef.current = performance.now();
+    scanPreparationMsRef.current = 0;
+    scanUploadMsRef.current = 0;
+    setClientScanTiming(null);
+    setScanStage("Retrying scan");
     try {
       setError("");
       const retried = await api<DocumentRecord>(`/documents/${source.id}/retry`, { method: "POST" });
@@ -741,6 +818,9 @@ function App() {
       setBusy(true);
       setNotice(`Retrying scan for ${source.original_filename}.`);
     } catch (err) {
+      scanSubmissionRef.current = false;
+      scanStartedAtRef.current = 0;
+      setScanStage("");
       setError(err instanceof Error ? err.message : "Could not retry this scan.");
     }
   }
@@ -983,7 +1063,7 @@ function App() {
           <div><p className="eyebrow">BUSINESS CONTACTS</p><h1>{tab === "form" ? title : "Your leads"}</h1>
             <p className="subheading">Scan business documents and keep your contacts in one place.</p></div>
           <div className="upload-actions">
-            <button className="button button-secondary" type="button" onClick={() => { setCameraFiles([]); setCameraError(""); setCameraOpen(true); }}>Open camera</button>
+            <button className="button button-secondary" type="button" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraError(""); setCameraOpen(true); }}>Open camera</button>
             <label className="button button-primary upload-button"><span aria-hidden="true">＋</span> Upload files
               <input type="file" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.gif,.pdf,.zip,.txt,.csv,.xlsx" onChange={upload} />
             </label>
@@ -1000,7 +1080,7 @@ function App() {
 
         {error && <div className="alert alert-error" role="alert">{error}<button aria-label="Dismiss" onClick={() => setError("")}>×</button></div>}
         {notice && <div className="alert alert-success" role="status">{notice}<button aria-label="Dismiss" onClick={() => setNotice("")}>×</button></div>}
-        {pendingDocuments.length > 0 && <div className="scan-progress" role="status"><span className="spinner" />Reading document. You will check the details before saving.</div>}
+        {(pendingDocuments.length > 0 || scanStage) && <div className="scan-progress" role="status"><span className="spinner" />{scanStage || "Preparing scan"}. You will check the details before saving.</div>}
 
         {tab === "leads" ? (
           <>
@@ -1051,10 +1131,10 @@ function App() {
                   {document.processing_status === "failed" && <button className="text-button" onClick={() => void retryDocument(document)}>Retry OCR</button>}
                 </div>}
                 {selectableScanIssues.some((item) => item.id !== document.id) && <label className="draft-picker"><span>Uploaded drafts in this batch</span><select value="" onChange={(event) => { const next = selectableScanIssues.find((item) => item.id === event.target.value); if (next) void reviewDocument(next); }}><option value="">Open another draft…</option>{selectableScanIssues.filter((item) => item.id !== document.id).map((item) => <option value={item.id} key={item.id}>{item.original_filename} · {item.processing_status.replace("_", " ")}</option>)}</select></label>}
-                {busy && <p className="processing-note"><span className="spinner" />Reading document…</p>}
+                {busy && <p className="processing-note"><span className="spinner" />{scanStage || "Preparing scan"}…</p>}
                 {(document.extracted_fields.cards?.[activeCardIndex]?.translation_message || document.extracted_fields.translation_message) && <p role="status" className="review-warning">{textValue(document.extracted_fields.cards?.[activeCardIndex]?.translation_message || document.extracted_fields.translation_message)}</p>}
                 {(document.extracted_fields.cards?.[activeCardIndex]?.review_warnings || document.extracted_fields.review_warnings || []).length > 0 && <ul className="review-warning" role="status">{(document.extracted_fields.cards?.[activeCardIndex]?.review_warnings || document.extracted_fields.review_warnings || []).map((warning) => <li key={warning}>{warning}</li>)}</ul>}
-                {(() => { const measured = document.extracted_fields.cards?.[activeCardIndex]?.processing_times_ms || document.extracted_fields.processing_times_ms; return measured ? <p className="processing-note">Scan time: OCR {((measured.ocr_ms || 0) / 1000).toFixed(1)}s · translation {((measured.translation_ms || 0) / 1000).toFixed(1)}s · total {((measured.total_ms || 0) / 1000).toFixed(1)}s</p> : null; })()}
+                {(() => { const measured = document.extracted_fields.cards?.[activeCardIndex]?.processing_times_ms || document.extracted_fields.processing_times_ms; const clientTiming = clientScanTiming?.documentId === document.id ? clientScanTiming : null; return measured ? <details className="processing-note"><summary>Scan timing</summary><p>{clientTiming ? `Browser image prep ${(clientTiming.prepareMs / 1000).toFixed(2)}s · upload ${(clientTiming.uploadMs / 1000).toFixed(1)}s · ` : ""}queue {( (measured.queue_ms || 0) / 1000).toFixed(1)}s · image decode {( (measured.decode_ms || 0) / 1000).toFixed(2)}s · server image prep {( (measured.preprocess_ms || 0) / 1000).toFixed(2)}s · OCR {( (measured.ocr_ms || 0) / 1000).toFixed(1)}s · model load {( (measured.translation_model_init_ms || 0) / 1000).toFixed(1)}s · translation {( (measured.translation_inference_ms ?? measured.translation_ms ?? 0) / 1000).toFixed(1)}s · fields {( (measured.field_extraction_ms || 0) / 1000).toFixed(2)}s · QR {( (measured.qr_ms || 0) / 1000).toFixed(2)}s · server {( (measured.total_ms || 0) / 1000).toFixed(1)}s{clientTiming ? ` · app-to-result ${(clientTiming.totalMs / 1000).toFixed(1)}s` : ""}</p></details> : null; })()}
                 {(() => { const sources = document.extracted_fields.cards?.[activeCardIndex]?.field_sources || document.extracted_fields.field_sources; const entries = Object.entries(sources || {}); return entries.length ? <details><summary>Source line for each extracted field</summary><ul>{entries.map(([key, source]) => <li key={key}><strong>{key.replace(/_/g, " ")}</strong> · {source.source_type} · {source.confidence === "high" ? "high confidence" : "check against card"}: <span>{source.source_text || "No exact source line found"}</span></li>)}</ul></details> : null; })()}
                 {!!(document.extracted_fields.cards?.[activeCardIndex]?.qr_payloads || document.extracted_fields.qr_payloads)?.length && <details><summary>QR code data for verification</summary><pre style={{ whiteSpace: "pre-wrap" }}>{(document.extracted_fields.cards?.[activeCardIndex]?.qr_payloads || document.extracted_fields.qr_payloads || []).join("\n\n")}</pre></details>}
                 {!!(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text) && <details><summary>Original OCR text</summary><pre style={{ whiteSpace: "pre-wrap" }}>{textValue(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text)}</pre></details>}
@@ -1079,7 +1159,7 @@ function App() {
             </div>
           </section>
         )}
-        {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture card images</h2><p>{cameraFiles.length ? `${cameraFiles.length} image${cameraFiles.length === 1 ? "" : "s"} captured. Capture the back side too, then scan.` : "Capture the front side, then optionally capture the back side."}</p><p className="camera-tip">For a sharper scan, use bright even light, hold the phone steady, and fit the whole card inside the frame.</p></div><button className="details-close" aria-label="Close camera" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => { setCameraFiles([]); setCameraOpen(false); }}>Cancel</button><button className="button button-secondary" onClick={() => void capturePhoto()}>Capture {cameraFiles.length ? "another" : "image"}</button><button className="button button-primary" onClick={() => void finishCameraScan()} disabled={!cameraFiles.length}>Scan {cameraFiles.length || ""} image{cameraFiles.length === 1 ? "" : "s"}</button></div></section></div>}
+        {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture card images</h2><p>{cameraFiles.length ? `${cameraFiles.length} image${cameraFiles.length === 1 ? "" : "s"} captured. Capture the back side too, then scan.` : "Capture the front side, then optionally capture the back side."}</p><p className="camera-tip">For a sharper scan, use bright even light, hold the phone steady, and fit the whole card inside the frame.</p></div><button className="details-close" aria-label="Close camera" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraOpen(false); }}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraOpen(false); }}>Cancel</button><button className="button button-secondary" onClick={() => void capturePhoto()}>Capture {cameraFiles.length ? "another" : "image"}</button><button className="button button-primary" onClick={() => void finishCameraScan()} disabled={!cameraFiles.length}>Scan {cameraFiles.length || ""} image{cameraFiles.length === 1 ? "" : "s"}</button></div></section></div>}
         {viewingLead && <div className="details-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setViewingLead(null); }}>
           <section className="details-dialog" role="dialog" aria-modal="true" aria-labelledby="details-title">
             <header className="details-heading"><div><span className="eyebrow">LEAD DETAILS</span><h2 id="details-title">{viewingLead.company_name}</h2><p>{viewingLead.lead_number}</p></div><button className="details-close" aria-label="Close details" onClick={() => setViewingLead(null)}>×</button></header>

@@ -17,7 +17,7 @@ except ImportError:  # QR scanning remains optional for lightweight local instal
     cv2 = None
     np = None
 from PIL import Image, ImageChops, ImageEnhance, ImageOps
-from .translation import translate_document_text, latin_name, latinize_document_text
+from .translation import translate_document_text, latin_name, latinize_document_text, model_initialization_time_ms
 from .qr import parse_qr_payload
 
 
@@ -1150,6 +1150,14 @@ def _record_processing_times(fields: dict[str, object], started: float, ocr_ms: 
     return fields
 
 
+def _set_processing_time(fields: dict[str, object], name: str, elapsed_ms: float) -> None:
+    times = fields.get("processing_times_ms")
+    if not isinstance(times, dict):
+        times = {}
+    times[name] = round(elapsed_ms)
+    fields["processing_times_ms"] = times
+
+
 def extract_fields(path: Path, content_type: str) -> dict[str, object]:
     started = time.perf_counter()
     if content_type == "application/pdf":
@@ -1157,50 +1165,71 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
         fields = _fields_from_ocr_text(_extract_text(path, content_type))
         return _record_processing_times(fields, started, (time.perf_counter() - ocr_started) * 1000)
 
+    decode_started = time.perf_counter()
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
-        regions = _split_card_image(image)
-        if regions and len(regions) > 1:
-            cards: list[dict[str, object]] = []
-            ocr_elapsed_ms = 0.0
-            for region in regions:
-                ocr_started = time.perf_counter()
-                text, line_heights = _read_card_text(region)
-                ocr_elapsed_ms += (time.perf_counter() - ocr_started) * 1000
-                card = _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(region))
-                cards.append(_record_processing_times(card, started, ocr_elapsed_ms))
-            cards = [card for card in cards if card.get("company_name") and (card.get("contact_numbers") or card.get("email_addresses") or card.get("website") or card.get("company_address"))]
-            if len(cards) > 1:
-                primary = cards[0].copy()
-                primary["cards"] = cards
-                return _record_processing_times(primary, started, ocr_elapsed_ms)
-        # Card photos are frequently portrait-oriented because the phone was
-        # held upright while the physical landscape card was sideways. OCR on
-        # the unrotated pixels causes names and labels to swap fields.
-        ocr_image = image.rotate(90, expand=True) if image.height > image.width * 1.25 else image
-        # Tesseract cost grows sharply with pixel count. Keep crisp card text
-        # while bounding memory and recognition time for full-resolution phone
-        # captures; the original image remains stored untouched.
-        longest_side = max(ocr_image.size)
-        if longest_side > 2200:
-            scale = 2200 / longest_side
-            ocr_image = ocr_image.resize(
-                (max(1, round(ocr_image.width * scale)), max(1, round(ocr_image.height * scale))),
-                Image.Resampling.LANCZOS,
-            )
-        ocr_started = time.perf_counter()
-        text, line_heights = _read_card_text(ocr_image)
-        ocr_ms = (time.perf_counter() - ocr_started) * 1000
-        fields = _merge_qr_fields(_fields_from_ocr_text(text, line_heights), _decode_qr_payloads(image) + _decode_qr_payloads(ocr_image))
-        return _record_processing_times(fields, started, ocr_ms)
+    decode_ms = (time.perf_counter() - decode_started) * 1000
+    preprocessing_started = time.perf_counter()
+    regions = _split_card_image(image)
+    preprocessing_ms = (time.perf_counter() - preprocessing_started) * 1000
+    if regions and len(regions) > 1:
+        cards: list[dict[str, object]] = []
+        ocr_elapsed_ms = 0.0
+        for region in regions:
+            ocr_started = time.perf_counter()
+            text, line_heights = _read_card_text(region)
+            ocr_elapsed_ms += (time.perf_counter() - ocr_started) * 1000
+            card_fields = _fields_from_ocr_text(text, line_heights)
+            qr_started = time.perf_counter()
+            qr_payloads = _decode_qr_payloads(region)
+            card = _merge_qr_fields(card_fields, qr_payloads)
+            card = _record_processing_times(card, started, ocr_elapsed_ms)
+            _set_processing_time(card, "decode_ms", decode_ms)
+            _set_processing_time(card, "preprocess_ms", preprocessing_ms)
+            _set_processing_time(card, "qr_ms", (time.perf_counter() - qr_started) * 1000)
+            cards.append(card)
+        cards = [card for card in cards if card.get("company_name") and (card.get("contact_numbers") or card.get("email_addresses") or card.get("website") or card.get("company_address"))]
+        if len(cards) > 1:
+            primary = cards[0].copy()
+            primary["cards"] = cards
+            return _record_processing_times(primary, started, ocr_elapsed_ms)
+
+    # Card photos are frequently portrait-oriented because the phone was held
+    # upright while the physical landscape card was sideways.
+    ocr_image = image.rotate(90, expand=True) if image.height > image.width * 1.25 else image
+    longest_side = max(ocr_image.size)
+    if longest_side > 2200:
+        scale = 2200 / longest_side
+        ocr_image = ocr_image.resize(
+            (max(1, round(ocr_image.width * scale)), max(1, round(ocr_image.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    preprocessing_ms = (time.perf_counter() - preprocessing_started) * 1000
+    ocr_started = time.perf_counter()
+    text, line_heights = _read_card_text(ocr_image)
+    ocr_ms = (time.perf_counter() - ocr_started) * 1000
+    extracted_fields = _fields_from_ocr_text(text, line_heights)
+    qr_started = time.perf_counter()
+    qr_payloads = _decode_qr_payloads(image)
+    if ocr_image is not image:
+        qr_payloads += _decode_qr_payloads(ocr_image)
+    fields = _merge_qr_fields(extracted_fields, qr_payloads)
+    fields = _record_processing_times(fields, started, ocr_ms)
+    _set_processing_time(fields, "decode_ms", decode_ms)
+    _set_processing_time(fields, "preprocess_ms", preprocessing_ms)
+    _set_processing_time(fields, "qr_ms", (time.perf_counter() - qr_started) * 1000)
+    return fields
 
 
 def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | None = None) -> dict[str, object]:
+    extraction_started = time.perf_counter()
     fields = _parse_fields(original_text, line_heights)
     translation_source = _translation_focus_text(original_text)
+    model_init_before = model_initialization_time_ms()
     translation_started = time.perf_counter()
     translated, status = translate_document_text(translation_source)
     translation_ms = round((time.perf_counter() - translation_started) * 1000)
+    model_init_ms = max(0, model_initialization_time_ms() - model_init_before)
     if translated and status == "translated":
         heights = {after.casefold(): (line_heights or {}).get(before.casefold(), 0)
                    for before, after in zip(original_text.splitlines(), translated.splitlines())}
@@ -1326,5 +1355,8 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
     if not isinstance(processing_times, dict):
         processing_times = {}
     processing_times["translation_ms"] = translation_ms
+    processing_times["translation_model_init_ms"] = model_init_ms
+    processing_times["translation_inference_ms"] = max(0, translation_ms - model_init_ms)
+    processing_times["field_extraction_ms"] = max(0, round((time.perf_counter() - extraction_started) * 1000) - translation_ms)
     fields["processing_times_ms"] = processing_times
     return fields
