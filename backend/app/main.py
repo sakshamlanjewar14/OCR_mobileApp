@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from sqlalchemy import func, inspect, or_, select, text
+from sqlalchemy import func, inspect, or_, select, text, update
 from sqlalchemy.orm import Session
 from PIL import Image, UnidentifiedImageError
 
@@ -826,17 +826,30 @@ def retry_document(document_id: str, request: Request, background_tasks: Backgro
     document = db.get(Document, document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found.")
+    if document.processing_status != "failed":
+        raise HTTPException(status_code=409, detail="Only failed scans can be retried. This scan is already queued, processing, or ready for review.")
+    if not Path(document.storage_path).is_file():
+        raise HTTPException(status_code=410, detail="The saved source image is unavailable. Upload the card again to retry OCR.")
     if not _reserve_ocr_slots(1):
         raise HTTPException(status_code=503, detail="OCR is busy. Wait briefly and retry the scan.", headers={"Retry-After": "3"})
-    document.processing_status = "uploaded"
-    document.error_message = None
     try:
+        # The conditional transition makes concurrent retry requests idempotent
+        # across API workers: only one request can claim a failed document.
+        result = db.execute(update(Document).where(
+            Document.id == document_id,
+            Document.processing_status == "failed",
+        ).values(processing_status="uploaded", error_message=None))
         db.commit()
-        db.refresh(document)
     except Exception:
         _ocr_slots.release()
         db.rollback()
         raise
+    if result.rowcount != 1:
+        _ocr_slots.release()
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This scan has already been retried or is no longer eligible for retry.")
+    document = db.get(Document, document_id)
+    db.refresh(document)
     background_tasks.add_task(_process_reserved_document, document_id, request.state.request_id)
     return _read_document(document)
 

@@ -12,6 +12,8 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from fastapi import HTTPException
+from starlette.background import BackgroundTasks
+from starlette.requests import Request
 from openpyxl import load_workbook
 from PIL import Image
 
@@ -162,6 +164,32 @@ class DocumentReviewFlowTests(unittest.TestCase):
             self.assertEqual(document.processing_status, "failed")
             self.assertTrue(document.error_message)
             self.assertEqual(db.scalar(select(func.count()).select_from(Lead)), 0)
+
+    def test_retry_only_claims_failed_scan_once_and_keeps_source(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            handle.write(b"source")
+            source_path = Path(handle.name)
+        self.addCleanup(source_path.unlink, missing_ok=True)
+        with self.session_factory() as db:
+            document = db.get(Document, "review-document")
+            document.processing_status = "failed"
+            document.storage_path = str(source_path)
+            db.commit()
+            request = Request({"type": "http", "method": "POST", "path": "/api/documents/review-document/retry", "headers": []})
+            request.state.request_id = "request-id"
+            tasks = BackgroundTasks()
+            import threading
+            slots = threading.BoundedSemaphore(1)
+            with patch.object(main, "_ocr_slots", slots):
+                queued = main.retry_document("review-document", request, tasks, db)
+                self.assertEqual(queued.processing_status, "uploaded")
+                self.assertTrue(source_path.is_file())
+                with self.assertRaises(HTTPException) as error:
+                    main.retry_document("review-document", request, BackgroundTasks(), db)
+                self.assertEqual(error.exception.status_code, 409)
+                self.assertEqual(len(tasks.tasks), 1)
+                self.assertFalse(slots.acquire(blocking=False))
+                slots.release()
 
     def test_user_confirmation_is_required_before_ocr_draft_is_saved(self) -> None:
         with self.session_factory() as db:

@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+# Keep the default image lean. Set INSTALL_TRANSLATION=1 only when enabling
+# the optional local M2M100 translation model on a persistent host disk.
+ARG INSTALL_TRANSLATION=0
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -15,7 +19,14 @@ WORKDIR /app
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY requirements-translation.txt ./requirements-translation.txt
+RUN if [ "$INSTALL_TRANSLATION" = "1" ]; then \
+      pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+      && pip install --no-cache-dir -r requirements-translation.txt; \
+    fi
+
 COPY app ./app
+COPY scripts ./scripts
 
 # Liveness only: dependency readiness is exposed separately at /api/ready.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \

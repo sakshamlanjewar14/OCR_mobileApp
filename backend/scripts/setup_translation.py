@@ -2,6 +2,7 @@
 from pathlib import Path
 from urllib.request import urlopen
 import shutil
+import os
 
 REVISION = "55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636"
 FILES = ("README.md", "config.json", "generation_config.json", "sentencepiece.bpe.model",
@@ -9,7 +10,10 @@ FILES = ("README.md", "config.json", "generation_config.json", "sentencepiece.bp
 
 
 def main():
-    target = Path(__file__).resolve().parents[1] / "ocr-runtime" / "m2m100_418M"
+    configured_target = os.getenv("TRANSLATION_MODEL_DIR", "").strip()
+    target = Path(configured_target).expanduser() if configured_target else (
+        Path(__file__).resolve().parents[1] / "ocr-runtime" / "m2m100_418M"
+    )
     target.mkdir(parents=True, exist_ok=True)
     for name in FILES:
         temporary = target / (name + ".partial")
