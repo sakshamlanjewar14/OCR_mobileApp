@@ -5,7 +5,10 @@ import { parseQrLocally, recognizeCard } from "./clientOcr";
 
 // Development uses the Vite same-origin proxy so cookie authentication is not
 // blocked by browser CORS. Production keeps the configured API origin.
-const API = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "/api" : `http://${window.location.hostname}:8000/api`);
+// Vite environment values are baked into the production bundle. Keep a
+// working hosted fallback so a missing VITE_API_URL cannot point a deployed
+// phone app at the Vercel frontend host on port 8000.
+const API = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "/api" : "https://ocr-mobileapp.onrender.com/api");
 
 type Lead = {
   id: string;
