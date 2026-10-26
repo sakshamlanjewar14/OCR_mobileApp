@@ -166,9 +166,15 @@ def _session_response(response, user: User, db: Session):
     db.add(AuthSession(id=secrets.token_hex(32), user_id=user.id, token_hash=_token_hash(raw_token),
                        expires_at=_now() + timedelta(hours=SESSION_TTL_HOURS)))
     db.commit()
+    secure = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+    same_site = os.getenv("COOKIE_SAMESITE", "none" if secure else "lax").lower()
+    if same_site not in {"lax", "strict", "none"}:
+        same_site = "none" if secure else "lax"
+    # Cross-domain production PWAs require SameSite=None and Secure so the
+    # authenticated API requests retain the session cookie. Local HTTP keeps
+    # the existing Lax behavior unless explicitly configured otherwise.
     response.set_cookie(SESSION_COOKIE, raw_token, max_age=SESSION_TTL_HOURS * 3600,
-                        httponly=True, secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
-                        samesite="lax", path="/")
+                        httponly=True, secure=secure, samesite=same_site, path="/")
     return response
 
 
