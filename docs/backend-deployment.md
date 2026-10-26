@@ -2,7 +2,20 @@
 
 The API runs in the existing FastAPI/Tesseract stack. It stores uploaded source files under `UPLOAD_DIR` for review, so provision persistent private storage and back up that directory only if the application needs those source cards. There is no external OCR API call. Tesseract is reused by the process; the optional translation model is loaded once per process and can be warmed during startup when `TRANSLATION_MODEL_DIR` points to a persistent local model directory.
 
+Text-based PDFs now use embedded PDF text directly and invoke OCR only for pages without usable text. This reduces processing time and avoids OCR digit errors for selectable phone numbers, emails, and registered names. Image-only PDFs continue through the existing bounded OCR path.
+
 ## Runtime settings
+
+Before deploying the persistent save replay protection, run the forward-only
+database migration from the `backend/` directory:
+
+```bash
+python scripts/migrate.py
+```
+
+It is safe to run more than once. The API startup check also creates the table
+when permitted, but running the migration explicitly gives production deploys
+an auditable database step.
 
 Set these in the backend environment (the example file is `backend/.env.example`):
 
@@ -14,6 +27,19 @@ Set these in the backend environment (the example file is `backend/.env.example`
 | `MAX_PDF_PAGES` | `5` | Maximum pages per PDF. |
 | `MAX_OCR_CONCURRENCY` | `1` | Maximum active/accepted upload jobs per process. A batch is one sequential job. When full, the API returns `503` and `Retry-After: 3`. |
 | `WEB_CONCURRENCY` | `1` | Uvicorn process count. Keep at one until memory and throughput are measured; every process loads its own translation model and OCR state. |
+| `EXPORT_STREAM_THRESHOLD` | `50000` | Lead count at which XLSX export switches to write-only, temporary-file streaming to keep RAM bounded. |
+| `AUTH_REQUIRED` | `true` | Require a valid session for lead, document, OCR, import, export, QR, and geocoding APIs. Keep enabled in production. |
+| `SESSION_TTL_HOURS` | `24` | Session-cookie lifetime. |
+| `RESET_TTL_MINUTES` | `30` | Password-reset token lifetime. |
+| `COOKIE_SECURE` | `false` | Set to `true` when the API is served over HTTPS. |
+
+Lead list/export ordering uses `(created_at, id)` indexes and contact lookup uses composite lead/type/position indexes. Exports fetch pages with keyset cursors instead of increasingly expensive SQL offsets. Existing databases install these indexes idempotently at startup; schedule the first index build during a low-traffic window because a large production table may briefly use database resources while an index is created. Exports up to the threshold retain the existing formatting; larger exports stream the same XLSX format through a temporary file and clean it up after the response is sent. Excel itself supports up to 1,048,576 rows per sheet, so a single-sheet export has a practical ceiling of 1,048,575 leads plus the header; split larger exports into batches.
+
+Spreadsheet lead generation sends rows in 1,000-row requests and the API flushes each request in 1,000-row ORM chunks. This keeps mobile request bodies and server identity-map memory bounded while retaining the current review workflow. For a sustained million-row ingestion, use a database-native bulk loader or a queued import job after measuring the deployment; the interactive browser import is intentionally bounded for reliability.
+
+Authentication uses an HttpOnly SameSite session cookie and bcrypt password hashes (with a PBKDF2-SHA256 fallback only when the optional bcrypt package is unavailable in a minimal local environment), with per-user ownership checks on leads and documents. Reset tokens are hashed, single-use, and expiring. Configure an HTTPS email provider around `/api/auth/forgot-password` before production; development responses include a reset token so the flow can be tested locally. Existing legacy rows with no owner remain available only to direct maintenance/test access; newly created records are assigned to the logged-in user.
+
+The Vite development server proxies `/api` to `http://127.0.0.1:8000`, so local cookie authentication stays same-origin and does not depend on browser CORS. Production builds continue using `VITE_API_URL` when it is configured.
 
 The repository documents Render as the current hosted backend target. In Render, use a Docker Web Service with `backend/` as the root directory, set `DATABASE_URL` and the exact frontend origin in `CORS_ORIGINS`, set `UPLOAD_DIR=/var/data/uploads`, and attach a persistent disk mounted at `/var/data` because the app retains the original card beside the review form. Set `MAX_OCR_CONCURRENCY=1` and `WEB_CONCURRENCY=1` initially. Configure the service health check to `/api/ready`; Docker's built-in `HEALTHCHECK` uses the lighter `/api/health`. Use an always-on instance for predictable first-scan time if the selected Render service supports it, and set the minimum instance count to one. An always-on instance and persistent disk can add hosting charges; check Render's current plan and disk prices before enabling them. Keep the backend private or put it behind an authenticated gateway until application identity is implemented.
 

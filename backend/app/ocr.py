@@ -16,7 +16,7 @@ try:
 except ImportError:  # QR scanning remains optional for lightweight local installs.
     cv2 = None
     np = None
-from PIL import Image, ImageChops, ImageEnhance, ImageOps
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageStat
 from .translation import translate_document_text, latin_name, latinize_document_text, model_initialization_time_ms
 from .qr import parse_qr_payload
 
@@ -276,6 +276,26 @@ def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> l
 
 def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
     text, heights = _read_image_with_layout(image)
+
+    # Phone cameras often produce a soft, low-contrast frame even when the
+    # card looks readable in the preview.  Use one inexpensive recovery pass
+    # on a normalized copy only when the first read is weak.  The original
+    # image remains the source shown to the user and used for QR decoding.
+    def quality(value: str) -> int:
+        letters = len(re.findall(r"[A-Za-z]{2,}", value))
+        identifiers = 3 * len(re.findall(r"@|(?:https?://|www\\.)|\\+?\\d(?:[\\s().-]*\\d){6,}", value, re.I))
+        indic = len(re.findall(r"[\\u0900-\\u097F]", value))
+        noise = len(re.findall(r"[^\\w\\s@./:+-]", value))
+        return letters + identifiers + indic - min(noise, 12)
+
+    gray_stats = ImageStat.Stat(ImageOps.grayscale(image))
+    low_contrast_capture = 5 < (gray_stats.extrema[0][1] - gray_stats.extrema[0][0]) < 150
+    if low_contrast_capture and (quality(text) < 12 or not re.search(r"@|(?:https?://|www\\.)|\\+?\\d(?:[\\s().-]*\\d){6,}", text, re.I)):
+        enhanced = ImageOps.autocontrast(ImageOps.grayscale(image), cutoff=1)
+        enhanced = enhanced.filter(ImageFilter.UnsharpMask(radius=1.1, percent=125, threshold=3)).convert("RGB")
+        enhanced_text, enhanced_heights = _read_image_with_layout(enhanced)
+        if quality(enhanced_text) > quality(text):
+            text, heights = enhanced_text, enhanced_heights
     # Preserve readable upright text. Retry sideways portrait photos only when
     # the first pass has no usable phone/email evidence, and choose one reading
     # rather than unioning conflicting digits from different orientations.
@@ -331,6 +351,14 @@ def _extract_text(path: Path, content_type: str) -> str:
     if content_type == "application/pdf":
         with pymupdf.open(path) as pdf:
             for page in pdf:
+                # Text-based PDFs already contain the exact source text. Read
+                # it directly and avoid rendering/OCR, which is slower and can
+                # corrupt phone numbers, emails, and legal names. Scanned PDFs
+                # fall back to OCR only when a page has no usable text.
+                embedded = page.get_text("text").strip()
+                if sum(char.isalnum() for char in embedded) >= 12:
+                    chunks.append(embedded)
+                    continue
                 pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
                 image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
                 chunks.append(_read_image(image))
@@ -531,7 +559,38 @@ def _clean_lines(text: str) -> list[str]:
 
 def _format_labeled_text(text: str) -> str:
     """Keep recognized label/value pairs together in the editable source text."""
-    lines = [re.sub(r"\s+", " ", line.replace("\ufffd", "").replace("•", "")).strip() for line in text.splitlines() if line.strip()]
+    lines = []
+    for raw_line in text.splitlines():
+        # The editable preview is intentionally English/Latin only. Keep the
+        # untouched multilingual OCR in original_ocr_text for audit.
+        line = re.sub(r"[^\x00-\x7F]", " ", raw_line.replace("\ufffd", "").replace("•", ""))
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        # The editable transcript is a useful review aid, not a dump of every
+        # pixel the OCR engine interpreted. Keep contact/address lines and
+        # readable words, while dropping QR/background fragments and isolated
+        # numbers. The untouched transcript remains in original_ocr_text.
+        letters = len(re.findall(r"[A-Za-z\u0900-\u097F]", line))
+        digits = len(re.findall(r"\d", line))
+        symbols = len(re.findall(r"[^\w\s@.+,&'()/:-]", line, re.UNICODE))
+        words = re.findall(r"[A-Za-z]{2,}", line)
+        has_contact_pattern = bool(re.search(
+            r"@|(?:https?://|www\.)|(?:facebook|instagram|linkedin)\.com|\+?\d(?:[\s().-]*\d){6,}",
+            line, re.I
+        ))
+        has_address_marker = bool(re.search(
+            r"\b(?:plot|road|street|near|college|square|phase|chakan|pune|india|maharashtra|"
+            r"address|tal\.?|dist\.?|pin|pvt\.?|ltd\.?)\b", line, re.I
+        ))
+        title_or_upper_word = any(word.isupper() or word[:1].isupper() for word in words)
+        readable_sentence = len(words) >= 2 and title_or_upper_word
+        readable_single = len(words) == 1 and len(words[0]) >= 4 and title_or_upper_word
+        if not has_contact_pattern and not has_address_marker and not (readable_sentence or readable_single):
+            continue
+        if not has_contact_pattern and (digits > letters and digits >= 2 or symbols > max(2, letters // 2)):
+            continue
+        lines.append(line)
     label_names = (
         r"company(?:\s+(?:full\s+)?name)?|business(?:\s+name)?|firm(?:\s+name)?|organization(?:\s+name)?|owner(?:\s+name)?|"
         r"contact\s+(?:person|name)|person\s+name|name|designation|job\s+title|position|address|"
@@ -640,9 +699,13 @@ def _explicit_fields(text: str) -> dict[str, list[str]]:
                 )
             elif target == "company_address":
                 address_parts = [value]
-                for continuation in source[index + 1:index + 5]:
+                address_continuation = re.compile(
+                    r",|\b(?:road|rd|street|near|plot|shop|floor|complex|market|college|square|"
+                    r"tal\.?|dist\.?|district|pune|talegaon|maval|india|maharashtra|kanpur|"
+                    r"411\d{3}|410\d{3}|208\d{3}|412\d{3})\b", re.I)
+                for continuation in source[index + 1:index + 9]:
                     if (not continuation or re.search(r"@|(?:https?://|www\.)|\+?\d[\d ()-]{7,}|\b(?:tel|mobile|phone|fax|email|website)\b", continuation, re.I)
-                            or not re.search(r"\b(?:road|rd|street|near|plot|shop|floor|complex|market|pune|india|maharashtra|kanpur|411\d{3}|208\d{3}|412\d{3})\b", continuation, re.I)):
+                            or not address_continuation.search(continuation)):
                         break
                     address_parts.append(continuation)
                 found.setdefault(target, []).append(", ".join(address_parts))
@@ -957,6 +1020,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     address_marker = re.compile(
         r"\b(road|rd\.?|street|st\.?|avenue|ave\.?|lane|ln\.?|suite|floor|block|sector|"
         r"near|complex|building|tower|plot|shop|area|landmark|district|state|province|region|city|town|pune|mumbai|kanpur|belapur|pimpri|"
+        r"college|square|talegaon|maval|tal\.?|dist\.?|maharashtra|"
         r"रोड|रस्ता|मार्ग|गली|नगर|बाजार|मार्केट|निकट|ऊपर|चौक|कानपुर|पुणे|महाराष्ट्र|पता|"
         r"\d{3}\s?\d{3}|\d{5,6})\b",
         re.I,
@@ -964,7 +1028,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     excluded_address_lines = {value.strip().casefold() for value in (company, owner, designation) if value}
     address_indexes = explicit_address_indexes or [
         index for index, line in enumerate(lines)
-        if line.strip().casefold() not in excluded_address_lines
+        if (line.strip().casefold() not in excluded_address_lines or address_marker.search(line))
         and not re.match(r"^\s*(?:mob(?:ile)?|tel(?:ephone)?|fax|email)\b", line, re.I)
         and not phone_pattern.search(line) and not re.search(r"@|(?:https?://|www\.)", line, re.I)
         and address_marker.search(line)
@@ -973,20 +1037,30 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
     if address_indexes:
         start = address_indexes[0]
         boundary = re.compile(r"@|https?://|www\.|\b(mob|tel\.?|telephone|mobile|phone|email|e-mail|web|website|fax|director|manager|ceo|owner|founder|mto|iso)\b", re.I)
-        for index in range(start, min(len(lines), start + 5)):
+        continuation_marker = re.compile(
+            r",|\b(?:road|rd\.?|street|st\.?|avenue|lane|suite|floor|block|sector|near|complex|"
+            r"building|tower|plot|shop|area|landmark|district|state|province|region|city|town|"
+            r"college|square|tal\.?|dist\.?|pune|talegaon|maval|mumbai|kanpur|belapur|pimpri|"
+            r"maharashtra|india|\d{3}\s?\d{3}|\d{5,6})\b", re.I)
+        for index in range(start, min(len(lines), start + 9)):
             line = address_label.sub("", lines[index], count=1).strip(" ,;:-") if index == start else lines[index]
-            if not line or line.strip().casefold() in excluded_address_lines or boundary.search(line):
+            if not line or (line.strip().casefold() in excluded_address_lines and not address_marker.search(line)) or boundary.search(line):
                 break
             phone_match = phone_pattern.search(line)
             if phone_match:
                 line = line[:phone_match.start()].strip(" ,;:-")
                 if not line:
                     break
-            if index > start and not address_marker.search(line) and not re.search(r"\d", line):
+            if index > start and not continuation_marker.search(line) and not re.search(r"\d", line):
                 break
             address_parts.append(line)
     # Explicit labels always win over heuristic guesses. This is the key guard
     # against putting a labelled person/address/contact into the company field.
+    address_line_keys = {part.strip().casefold() for part in address_parts if part.strip()}
+    if not explicit.get("company_name") and company and company.strip().casefold() in address_line_keys:
+        company = None
+    if not explicit.get("owner_name") and owner and owner.strip().casefold() in address_line_keys:
+        owner = None
     labeled_contacts = explicit.get("contact_numbers", [])
     labeled_emails = explicit.get("email_addresses", [])
     # When a card labels mobile/contact numbers, do not pull digits from its
@@ -1105,15 +1179,24 @@ def _decode_qr_payloads(image: Image.Image) -> list[str]:
         ok, values, _, _ = detector.detectAndDecodeMulti(pixels)
         if ok and values is not None:
             decoded.extend(str(value).strip() for value in values if str(value).strip())
-        # Printed card QR codes are often only 70–100 pixels wide in a phone
-        # photo. OpenCV detects the finder pattern at native size but fails to
-        # decode its payload; a single 2x interpolation pass fixes that case.
-        if max(pixels.shape[:2]) < 2600:
-            enlarged = cv2.resize(pixels, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-            ok, values, _, _ = detector.detectAndDecodeMulti(enlarged)
-            if ok and values is not None:
-                decoded.extend(str(value).strip() for value in values if str(value).strip())
-            pixels = enlarged
+        # Printed QR codes can be detected at native size while decoding fails
+        # because the modules occupy only a few pixels. Try bounded enlargements
+        # before giving up; this handles rotated phone photos without sending a
+        # second OCR request or retaining the source image.
+        if not decoded and max(pixels.shape[:2]) < 2600:
+            for scale in (2, 3, 4):
+                enlarged = cv2.resize(pixels, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                ok, values, _, _ = detector.detectAndDecodeMulti(enlarged)
+                if ok and values is not None:
+                    decoded.extend(str(value).strip() for value in values if str(value).strip())
+                if decoded:
+                    pixels = enlarged
+                    break
+                value, _, _ = detector.detectAndDecode(enlarged)
+                if value and value.strip():
+                    decoded.append(value.strip())
+                    pixels = enlarged
+                    break
         if not decoded:
             value, _, _ = detector.detectAndDecode(pixels)
             if value and value.strip():

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from backend.app.ocr import _decode_qr_payloads, _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _read_recovery_crops, _split_card_image, extract_fields
+from backend.app.ocr import _decode_qr_payloads, _extract_text, _merge_ocr_transcripts, _merge_qr_fields, _parse_fields, _read_card_text, _read_image_with_layout, _read_recovery_crops, _split_card_image, extract_fields
 
 
 SCREENSHOT_PHONES = ["+91 89995 21798", "+91 74994 22904", "+91 98604 67728",
@@ -14,6 +14,20 @@ SCREENSHOT_PHONES = ["+91 89995 21798", "+91 74994 22904", "+91 98604 67728",
 
 
 class OCRLatencyRegressionTests(unittest.TestCase):
+    def test_text_pdf_skips_raster_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "card.pdf"
+            pdf = __import__("pymupdf").open()
+            page = pdf.new_page()
+            page.insert_text((72, 72), "Acme Industries Pvt Ltd\n+91 9876543210\nhello@example.com")
+            pdf.save(path)
+            pdf.close()
+            with patch("backend.app.ocr._read_image") as ocr:
+                text = _extract_text(path, "application/pdf")
+            self.assertIn("Acme Industries Pvt Ltd", text)
+            self.assertIn("+91 9876543210", text)
+            ocr.assert_not_called()
+
     def test_image_scan_reports_non_overlapping_pipeline_timings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "card.png"
@@ -48,6 +62,17 @@ class OCRLatencyRegressionTests(unittest.TestCase):
         qr = cv2.QRCodeEncoder_create().encode(payload)
         # A small rendered card QR should still decode after the bounded 2x pass.
         image = Image.fromarray(cv2.cvtColor(cv2.resize(qr, (84, 84)), cv2.COLOR_GRAY2RGB))
+        self.assertEqual(_decode_qr_payloads(image), [payload])
+
+    def test_qr_decoder_retries_high_enough_for_blurry_phone_photo(self) -> None:
+        import cv2
+        import numpy as np
+        payload = "https://www.walmartvriddhi.org/"
+        qr = cv2.QRCodeEncoder_create().encode(payload)
+        small = cv2.resize(qr, (62, 62), interpolation=cv2.INTER_AREA)
+        canvas = np.full((900, 500), 255, dtype=np.uint8)
+        canvas[360:422, 210:272] = small
+        image = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_GRAY2RGB))
         self.assertEqual(_decode_qr_payloads(image), [payload])
 
     def test_windows_fallback_uses_one_ocr_read_without_layout_retries(self) -> None:
@@ -406,6 +431,54 @@ class LeadFieldParsingTests(unittest.TestCase):
         self.assertNotIn("Dream Team", fields["company_address"])
         self.assertEqual(fields["contact_numbers"], ["+91 9820782043", "+91 40956600"])
         self.assertEqual(fields["email_addresses"], ["hemendra.manohar@i2ifoundation.org"])
+
+    def test_rmk_spaces_keeps_every_wrapped_address_line(self) -> None:
+        fields = _parse_fields(
+            " +91 7758 06 5699\n"
+            "businessdevelopment@rmkspaces.com\n"
+            "www.rmkspaces.com\n"
+            "RMK Square, Near Nutan Polytechnic College,\n"
+            "Talegaon Dabhade,\n"
+            "Tal. Maval, Dist. Pune, 410507,\n"
+            "Maharashtra, INDIA."
+        )
+        self.assertEqual(fields["contact_numbers"], ["+91 7758 06 5699"])
+        self.assertEqual(fields["email_addresses"], ["businessdevelopment@rmkspaces.com"])
+        self.assertEqual(fields["website"], "www.rmkspaces.com")
+        self.assertEqual(
+            fields["company_address"],
+            "RMK Square, Near Nutan Polytechnic College, Talegaon Dabhade, Tal. Maval, Dist. Pune, 410507, Maharashtra, INDIA."
+        )
+
+    def test_other_text_drops_ocr_symbol_noise_but_keeps_original_transcript(self) -> None:
+        source = "APEX CREATIONS\nVishal K. Desale\n© f\ne520 d\nS®PZO\n+91 98230 20019\nBuilders | Land Developer | Industrial Contractor"
+        fields = _parse_fields(source)
+        self.assertIn("APEX CREATIONS", fields["raw_text"])
+        self.assertIn("+91 98230 20019", fields["raw_text"])
+        self.assertNotIn("© f", fields["raw_text"])
+        self.assertNotIn("e520 d", fields["raw_text"])
+
+    def test_other_text_keeps_english_card_lines_and_drops_short_ocr_fragments(self) -> None:
+        fields = _parse_fields(
+            "Uday Ghule\n"
+            "+91-9922688148\n"
+            "+91 9922339768\n"
+            "ADSONS FURNISHERS PVT LTD\n"
+            "Plot No. PAP A-24, Chakan MIDC, Factory@adsonscorp.com\n"
+            "Phase-IV, Behind Mahindra & Mahindra, Nighoje, Pune - 410 501.\n"
+            "www.adsonscorp.com\n"
+            "S®PZO\n"
+            "ddd.tthe t\n"
+            "Rez <\n"
+            "333 es om"
+        )
+        self.assertIn("Uday Ghule", fields["raw_text"])
+        self.assertIn("ADSONS FURNISHERS PVT LTD", fields["raw_text"])
+        self.assertIn("www.adsonscorp.com", fields["raw_text"])
+        self.assertNotIn("S®PZO", fields["raw_text"])
+        self.assertNotIn("ddd.tthe t", fields["raw_text"])
+        self.assertNotIn("Rez <", fields["raw_text"])
+        self.assertNotIn("333 es om", fields["raw_text"])
 
     def test_screenshot_ocr_recovers_email_dot_only_from_matching_website(self) -> None:
         source = (

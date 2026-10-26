@@ -1,4 +1,8 @@
 .row-actions .view-action{width:25px;height:25px;display:grid;place-items:center;border:1px solid #dfe7df;border-radius:6px;color:#397552;padding:4px}
+.auth-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:#f4f8f4;color:#26352b}
+.auth-card{width:min(420px,100%);background:#fff;border:1px solid #dfe8df;border-radius:16px;padding:32px;box-shadow:0 18px 50px #23483218}
+.auth-card>.brand-mark{display:grid;place-items:center;width:46px;height:46px;border-radius:12px;background:#dff0e3;color:#176143;font-size:25px;margin-bottom:16px}
+.auth-card h1{margin:5px 0 8px;font:800 28px/1.2 Manrope,sans-serif}.auth-copy{color:#718076;font-size:13px;margin:0 0 24px}.auth-card form{display:grid;gap:14px}.auth-submit{width:100%;justify-content:center;margin-top:4px}.auth-links{display:flex;justify-content:space-between;gap:12px;margin-top:18px}.auth-links button{border:0;background:none;color:#28704d;font-size:12px;cursor:pointer;padding:0}.auth-error,.auth-message{font-size:12px;margin:14px 0 0;padding:10px;border-radius:7px}.auth-error{color:#9c3f34;background:#fff1ef}.auth-message{color:#28704d;background:#eff9f1}.auth-logout{margin-left:auto}.topbar .auth-logout{font-size:11px;padding:8px 12px}
 .row-actions .view-action:hover{background:#edf5ef;border-color:#b8d0bd}
 .view-action svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 .details-backdrop{position:fixed;inset:0;z-index:10;background:#17251db8;display:grid;place-items:center;padding:24px}

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -22,12 +22,20 @@ class Document(Base):
     extracted_fields: Mapped[dict] = mapped_column(JSON, default=dict)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     leads: Mapped[list["Lead"]] = relationship(back_populates="document")
     source_links: Mapped[list["LeadSourceImage"]] = relationship(back_populates="document")
 
 
 class Lead(Base):
     __tablename__ = "leads"
+    __table_args__ = (
+        # The list and export APIs use this stable ordering for pagination.
+        Index("ix_leads_created_at_id", "created_at", "id"),
+        Index("ix_leads_owner_name", "owner_name"),
+        Index("ix_leads_verification_status", "verification_status"),
+        Index("ix_leads_document_id", "document_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     lead_number: Mapped[str] = mapped_column(
@@ -49,6 +57,7 @@ class Lead(Base):
     document_id: Mapped[str | None] = mapped_column(
         ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
     )
+    owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
@@ -117,7 +126,11 @@ class Lead(Base):
 
 class LeadContact(Base):
     __tablename__ = "lead_contacts"
-    __table_args__ = (UniqueConstraint("lead_id", "contact_type", "value", name="uq_lead_contact_value"),)
+    __table_args__ = (
+        UniqueConstraint("lead_id", "contact_type", "value", name="uq_lead_contact_value"),
+        Index("ix_lead_contacts_lead_type_position", "lead_id", "contact_type", "position"),
+        Index("ix_lead_contacts_type_value", "contact_type", "value"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), index=True)
@@ -138,3 +151,57 @@ class LeadSourceImage(Base):
     position: Mapped[int] = mapped_column(Integer, default=0)
     lead: Mapped[Lead] = relationship(back_populates="source_images")
     document: Mapped[Document] = relationship(back_populates="source_links")
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    full_name: Mapped[str] = mapped_column(String(160))
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    normalized_email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    password_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class LeadIdempotency(Base):
+    """Durable replay protection for authenticated lead saves."""
+
+    __tablename__ = "lead_idempotency"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_lead_idempotency_user_key"),
+        Index("ix_lead_idempotency_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

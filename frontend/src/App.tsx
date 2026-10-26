@@ -1,7 +1,11 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import "./details.css";
+import { clearLeadDraft, enqueueLead, readLeadDraft, readLeadQueue, removeQueuedLead, saveLeadDraft } from "./draftStore";
+import { parseQrLocally, recognizeCard } from "./clientOcr";
 
-const API = import.meta.env.VITE_API_URL || `http://${window.location.hostname}:8000/api`;
+// Development uses the Vite same-origin proxy so cookie authentication is not
+// blocked by browser CORS. Production keeps the configured API origin.
+const API = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "/api" : `http://${window.location.hostname}:8000/api`);
 
 type Lead = {
   id: string;
@@ -73,6 +77,8 @@ type DocumentStatus = Pick<DocumentRecord, "id" | "processing_status" | "error_m
 type DocumentBatchResult = { documents: DocumentRecord[]; skipped_files: { filename: string; reason: string }[] };
 type RawCandidate = { source: string; row: number; fields: ExtractedLeadFields };
 type RawPreviewResult = { filename: string; candidates: { row: number; fields: ExtractedLeadFields }[] };
+type QRResult = { source_text?: string; contacts?: string[]; emails?: string[]; urls?: string[]; [key: string]: unknown };
+type WebsitePreview = { url: string; fields: Record<string, unknown>; source_text: string; warnings: string[] };
 type LeadPage = { leads: Lead[]; total: number; page: number; page_size: number };
 const LEADS_PAGE_SIZE = 50;
 
@@ -119,6 +125,23 @@ function mergeExtractedFields(records: DocumentRecord[]): ExtractedLeadFields {
   return merged;
 }
 
+function mergeLocalCards(records: ExtractedLeadFields[]): { fields: ExtractedLeadFields; conflicts: string[] } {
+  const fields: ExtractedLeadFields = {};
+  const conflicts: string[] = [];
+  const scalarKeys = ["company_name", "owner_name", "designation", "business_description", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const;
+  for (const key of scalarKeys) {
+    const values = [...new Set(records.map((item) => textValue(item[key]).trim()).filter(Boolean))];
+    if (values.length) fields[key] = key === "company_address" ? combineAddress(...values) : values[0];
+    if (values.length > 1 && key !== "company_address") conflicts.push(`${key.replace(/_/g, " ")}: ${values.join(" / ")}`);
+  }
+  fields.contact_numbers = stringValues(records.flatMap((item) => item.contact_numbers || []));
+  fields.email_addresses = stringValues(records.flatMap((item) => item.email_addresses || []));
+  fields.raw_text = records.map((item) => textValue(item.raw_text)).filter(Boolean).join("\n\n");
+  fields.original_ocr_text = records.map((item) => textValue(item.original_ocr_text)).filter(Boolean).join("\n\n");
+  fields.field_sources = Object.assign({}, ...records.map((item) => item.field_sources || {}));
+  return { fields, conflicts };
+}
+
 const emptyForm: LeadForm = {
   company_name: "",
   owner_name: "",
@@ -163,6 +186,10 @@ function combineAddress(...parts: (string | null | undefined)[]): string {
 }
 
 function textValue(value: string | null | undefined): string {
+  return typeof value === "string" ? value : "";
+}
+
+function safeText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
@@ -375,7 +402,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     });
     headers.set("X-Request-ID", requestId);
   }
-  const response = await fetch(`${API}${path}`, { ...init, headers });
+  const response = await fetch(`${API}${path}`, { ...init, headers, credentials: "include" });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${response.status})`);
@@ -384,7 +411,9 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function App() {
+type AuthUser = { id: string; full_name: string; email: string; is_verified: boolean };
+
+function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [leadTotal, setLeadTotal] = useState(0);
   const [leadPage, setLeadPage] = useState(1);
@@ -406,6 +435,17 @@ function App() {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraError, setCameraError] = useState("");
   const [cameraFiles, setCameraFiles] = useState<File[]>([]);
+  const [qrCameraOpen, setQrCameraOpen] = useState(false);
+  const [qrCameraError, setQrCameraError] = useState("");
+  const [localPreviewUrl, setLocalPreviewUrl] = useState("");
+  const [localPreviewUrls, setLocalPreviewUrls] = useState<string[]>([]);
+  const [ocrFallbackFiles, setOcrFallbackFiles] = useState<File[]>([]);
+  const [localConflicts, setLocalConflicts] = useState<string[]>([]);
+  const [localOriginalOcrText, setLocalOriginalOcrText] = useState("");
+  const [syncCount, setSyncCount] = useState(0);
+  const draftLoadedRef = useRef(false);
+  const [qrResult, setQrResult] = useState<QRResult | null>(null);
+  const [websitePreview, setWebsitePreview] = useState<WebsitePreview | null>(null);
   const [batchAsOneLead, setBatchAsOneLead] = useState(false);
   const [sourceDocumentIds, setSourceDocumentIds] = useState<string[]>([]);
   const [form, setForm] = useState<LeadForm>(emptyForm);
@@ -419,6 +459,9 @@ function App() {
   const [clientScanTiming, setClientScanTiming] = useState<{ documentId: string; prepareMs: number; uploadMs: number; totalMs: number } | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const qrVideoRef = useRef<HTMLVideoElement>(null);
+  const qrStreamRef = useRef<MediaStream | null>(null);
+  const qrScanTimerRef = useRef<number | null>(null);
   const scanSubmissionRef = useRef(false);
   const scanStartedAtRef = useRef(0);
   const scanPreparationMsRef = useRef(0);
@@ -507,6 +550,117 @@ function App() {
   }, [cameraOpen]);
 
   useEffect(() => {
+    if (!qrCameraOpen) return;
+    let cancelled = false;
+    setQrCameraError("");
+    const BarcodeDetectorCtor = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue?: string }>> } }).BarcodeDetector;
+    if (!navigator.mediaDevices?.getUserMedia || !BarcodeDetectorCtor) {
+      setQrCameraError("This browser cannot scan QR codes directly. Use the card image upload option instead.");
+      return;
+    }
+    const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((track) => track.stop()); return; }
+        qrStreamRef.current = stream;
+        if (qrVideoRef.current) { qrVideoRef.current.srcObject = stream; void qrVideoRef.current.play(); }
+        const scan = async () => {
+          if (cancelled || !qrVideoRef.current?.videoWidth) return;
+          try {
+            const detected = await detector.detect(qrVideoRef.current);
+            const value = detected.find((item) => item.rawValue?.trim())?.rawValue?.trim();
+            if (value) {
+              setQrCameraOpen(false);
+              const parsed = parseQrLocally(value) as QRResult;
+              setQrResult(parsed);
+              setWebsitePreview(null);
+              setForm((current) => ({
+                ...current,
+                company_name: current.company_name || safeText(parsed.company_name),
+                owner_name: current.owner_name || safeText(parsed.owner_name),
+                designation: current.designation || safeText(parsed.designation),
+                company_address: current.company_address || safeText(parsed.company_address),
+                website: current.website || safeText(parsed.website),
+                facebook_link: current.facebook_link || safeText(parsed.facebook_link),
+                instagram_link: current.instagram_link || safeText(parsed.instagram_link),
+                whatsapp_link: current.whatsapp_link || safeText(parsed.whatsapp_link),
+                contact_numbers: current.contact_numbers.length ? current.contact_numbers : (parsed.contacts || []),
+                email_addresses: current.email_addresses.length ? current.email_addresses : (parsed.emails || []),
+                raw_text: current.raw_text || safeText(parsed.source_text),
+              }));
+              setTab("form");
+              setNotice("QR code decoded. Review the extracted fields before saving.");
+              return;
+            }
+          } catch { /* Camera frames can be unavailable while autofocus settles. */ }
+          qrScanTimerRef.current = window.setTimeout(() => void scan(), 180);
+        };
+        void scan();
+      })
+      .catch(() => setQrCameraError("Camera access is unavailable. Allow camera permission or upload the QR/card image."));
+    return () => {
+      cancelled = true;
+      if (qrScanTimerRef.current) window.clearTimeout(qrScanTimerRef.current);
+      qrStreamRef.current?.getTracks().forEach((track) => track.stop());
+      qrStreamRef.current = null;
+    };
+  }, [qrCameraOpen]);
+
+  async function previewQrWebsite() {
+    const url = safeText(qrResult?.website);
+    if (!url) return;
+    setBusy(true);
+    try {
+      const result = await api<WebsitePreview>("/qr/website-preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+      setWebsitePreview(result);
+      setForm((current) => ({
+        ...current,
+        business_description: current.business_description || safeText(result.fields.business_description),
+        facebook_link: current.facebook_link || safeText(result.fields.facebook_link),
+        instagram_link: current.instagram_link || safeText(result.fields.instagram_link),
+        whatsapp_link: current.whatsapp_link || safeText(result.fields.whatsapp_link),
+      }));
+      setNotice(result.warnings.length ? result.warnings.join(" ") : "Website metadata loaded. Review it before saving.");
+    } catch (err) { setError(err instanceof Error ? err.message : "Could not read the public website."); }
+    finally { setBusy(false); }
+  }
+
+  async function enrichQrWebsite(extracted: ExtractedLeadFields) {
+    const payload = extracted.qr_payloads?.find((item) => /^https?:\/\//i.test(item));
+    const url = payload || safeText(extracted.website);
+    if (!url) return;
+    try {
+      const parsed = payload ? await api<QRResult>("/qr/parse", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ payload }) }) : { website: url };
+      setQrResult(parsed);
+      const result = await api<WebsitePreview>("/qr/website-preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: safeText(parsed.website) || url }) });
+      setWebsitePreview(result);
+      const websiteFields = result.fields;
+      // A website QR is authoritative only for values present on that public
+      // page. Keep the full OCR transcript below the form, but do not leave
+      // review-only OCR guesses (such as a misread owner/address) in fields.
+      setForm((current) => ({
+        ...current,
+        company_name: safeText(websiteFields.company_name),
+        owner_name: safeText(websiteFields.owner_name),
+        designation: safeText(websiteFields.designation),
+        business_description: safeText(websiteFields.business_description),
+        company_address: safeText(websiteFields.company_address),
+        website: safeText(websiteFields.website) || url,
+        facebook_link: safeText(websiteFields.facebook_link),
+        instagram_link: safeText(websiteFields.instagram_link),
+        whatsapp_link: safeText(websiteFields.whatsapp_link),
+        contact_numbers: Array.isArray(websiteFields.contact_numbers) ? websiteFields.contact_numbers.filter((value): value is string => typeof value === "string") : [],
+        email_addresses: Array.isArray(websiteFields.email_addresses) ? websiteFields.email_addresses.filter((value): value is string => typeof value === "string") : [],
+      }));
+      setNotice(result.warnings.length ? result.warnings.join(" ") : "QR website data loaded. Review the fields before saving.");
+    } catch {
+      // Keep the QR URL and OCR transcript available for manual review when
+      // the site is client-rendered, blocked, or temporarily unavailable.
+      setNotice("The QR website could not expose structured public contact data. Review the URL and source text manually.");
+    }
+  }
+
+  useEffect(() => {
     if (!pendingDocuments.some((item) => ["uploaded", "processing"].includes(item.processing_status))) return;
     setScanStage(pendingDocuments.some((item) => item.processing_status === "processing")
       ? "Reading card and extracting details"
@@ -551,6 +705,7 @@ function App() {
                 : batchDocuments[0];
               setDocument(fullDocument);
               setForm(formFromExtracted(fullDocument.extracted_fields || {}));
+              void enrichQrWebsite(fullDocument.extracted_fields || {});
               setTab("form");
               setNotice(fullDocument.processing_status === "needs_review"
                 ? "OCR finished. Check the source and lead details, then choose Save lead."
@@ -580,13 +735,57 @@ function App() {
     ? scanIssues.filter((item) => reviewBatchIds.includes(item.id))
     : scanIssues;
 
+  const flushQueuedLeads = useCallback(async () => {
+    if (!navigator.onLine) return;
+    const queued = await readLeadQueue(user.id).catch(() => []);
+    setSyncCount(queued.length);
+    for (const item of queued) {
+      try {
+        await api<Lead>("/leads", { method: "POST", headers: { "Content-Type": "application/json", "X-Idempotency-Key": item.idempotencyKey }, body: JSON.stringify(item.payload) });
+        await removeQueuedLead(item.id);
+      } catch {
+        break;
+      }
+    }
+    setSyncCount((await readLeadQueue(user.id).catch(() => [])).length);
+    if (queued.length) await loadLeads(1).catch(() => undefined);
+  }, [user.id, loadLeads]);
+
+  useEffect(() => {
+    void readLeadQueue(user.id).then((items) => setSyncCount(items.length)).catch(() => undefined);
+    const onOnline = () => { void flushQueuedLeads(); };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [user.id, flushQueuedLeads]);
+
+  useEffect(() => {
+    if (draftLoadedRef.current || document || editingLead || rawCandidates.length || tab !== "leads") return;
+    draftLoadedRef.current = true;
+    void readLeadDraft(user.id).then((draft) => {
+      if (!draft?.fields) return;
+      const restored = draft.fields as Partial<LeadForm>;
+      if (!Object.values(restored).some((value) => Array.isArray(value) ? value.length : String(value || "").trim())) return;
+      setForm((current) => ({ ...current, ...restored, contact_numbers: Array.isArray(restored.contact_numbers) ? restored.contact_numbers.map(String) : current.contact_numbers, email_addresses: Array.isArray(restored.email_addresses) ? restored.email_addresses.map(String) : current.email_addresses }));
+      setTab("form");
+      setNotice("An unfinished local draft was restored. Nothing has been saved to the server.");
+    }).catch(() => undefined);
+  }, [user.id, document, editingLead, rawCandidates.length, tab]);
+
+  useEffect(() => {
+    if (tab !== "form" || editingLead || document || rawCandidates.length) return;
+    const timer = window.setTimeout(() => { void saveLeadDraft(user.id, form as unknown as Record<string, unknown>).catch(() => undefined); }, 250);
+    return () => window.clearTimeout(timer);
+  }, [user.id, tab, editingLead, document, rawCandidates.length, form]);
+
   async function upload(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || []);
     event.target.value = "";
-    if (files.length) await uploadFiles(files);
+    // Use the reliable server OCR path for normal uploads. The browser WASM
+    // worker is optional and must not block a production scan.
+    if (files.length) await uploadFiles(files, false, false, true);
   }
 
-  async function uploadFiles(files: File[], asOneLead = false, cameraFilesAlreadyOptimized = false) {
+  async function uploadFiles(files: File[], asOneLead = false, cameraFilesAlreadyOptimized = false, forceServerOcr = false) {
     if (!files.length) return;
     if (scanSubmissionRef.current) return;
     setError("");
@@ -595,6 +794,11 @@ function App() {
     setEditingLead(null);
     setReviewedFingerprint("");
     setForm(emptyForm);
+    setLocalOriginalOcrText("");
+    setOcrFallbackFiles([]);
+    setLocalConflicts([]);
+    setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; });
+    setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; });
     setRawCandidates([]);
     setReviewBatchIds([]);
     setSourceDocumentIds([]);
@@ -634,6 +838,58 @@ function App() {
       if (!documentFiles.length && !rawFiles.length) throw new Error("Choose card images, PDF, ZIP, TXT, CSV, or XLSX files.");
         const imageFiles = documentFiles.filter((file) => /^(?:image\/(?:jpeg|png|webp|bmp))$/i.test(file.type) || /\.(jpe?g|png|webp|bmp)$/i.test(file.name));
       const otherDocuments = documentFiles.filter((file) => !imageFiles.includes(file));
+      if (!forceServerOcr && !rawFiles.length && imageFiles.length > 0 && imageFiles.length <= 4 && otherDocuments.length === 0) {
+        try {
+          setScanStage("Preparing card image for local OCR");
+          const localImageFiles = await Promise.all(imageFiles.map(async (file) => {
+            try {
+              const optimized = await optimizeCameraPhoto(file);
+              return optimized === file ? file : new File([optimized], file.name.replace(/\.[^.]+$/, ".jpg"), { type: optimized.type || "image/jpeg", lastModified: file.lastModified });
+            } catch {
+              return file;
+            }
+          }));
+          const localRecords: ExtractedLeadFields[] = [];
+          for (let index = 0; index < localImageFiles.length; index += 1) {
+            setScanStage(localImageFiles.length > 1 ? `Reading card image ${index + 1} of ${localImageFiles.length} on this device` : "Reading card on this device");
+            localRecords.push(await recognizeCard(localImageFiles[index], (message) => setScanStage(message)));
+          }
+          const { fields: local, conflicts } = mergeLocalCards(localRecords);
+          const hasUsefulValue = Boolean(local.company_name || local.contact_numbers?.length || local.email_addresses?.length || local.website);
+          if (hasUsefulValue) {
+            setForm(formFromExtracted(local));
+            setLocalOriginalOcrText(local.original_ocr_text || "");
+            const previewUrls = imageFiles.map((file) => URL.createObjectURL(file));
+            setLocalPreviewUrls(previewUrls);
+            setLocalPreviewUrl(previewUrls[0] || "");
+            setLocalConflicts(conflicts);
+            setTab("form");
+            setNotice(`${imageFiles.length > 1 ? `${imageFiles.length} card sides` : "Card"} read on this device. Review the fields; nothing has been uploaded or saved yet.`);
+            setBusy(false);
+            scanSubmissionRef.current = false;
+            scanStartedAtRef.current = 0;
+            setScanStage("");
+            return;
+          }
+          setOcrFallbackFiles(imageFiles);
+          setBusy(false);
+          scanSubmissionRef.current = false;
+          scanStartedAtRef.current = 0;
+          setScanStage("");
+          setNotice("Browser OCR found no reliable lead fields.");
+          setError("The image stayed on this device. Choose Retry locally or Use server OCR to continue.");
+          return;
+        } catch (error) {
+          setOcrFallbackFiles(imageFiles);
+          setBusy(false);
+          scanSubmissionRef.current = false;
+          scanStartedAtRef.current = 0;
+          setScanStage("");
+          setNotice(error instanceof Error ? error.message : "Browser OCR could not read this card.");
+          setError("The image stayed on this device. Choose Retry locally or Use server OCR to continue.");
+          return;
+        }
+      }
       let preparedFiles = documentFiles;
       if (documentFiles.length) {
         scanSubmissionRef.current = true;
@@ -726,18 +982,24 @@ function App() {
     setError("");
     setNotice("");
     try {
-      const result = await api<{ created: number }>("/leads/batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(validCandidates),
-      });
+      // Keep mobile request bodies small and let the API commit bounded ORM
+      // chunks. This avoids one huge JSON payload for large spreadsheet imports.
+      let created = 0;
+      for (let start = 0; start < validCandidates.length; start += 1000) {
+        const result = await api<{ created: number }>("/leads/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(validCandidates.slice(start, start + 1000)),
+        });
+        created += result.created;
+      }
       setLeadPage(1);
       await loadLeads(1);
       setRawCandidates([]);
       setRawCandidateIndex(0);
       setForm(emptyForm);
       setTab("leads");
-      setNotice(`${result.created} lead${result.created === 1 ? "" : "s"} generated. ${skipped ? `${skipped} row${skipped === 1 ? " was" : "s were"} skipped because the company name was blank. ` : ""}Generated records are marked Check data until reviewed.`);
+      setNotice(`${created} lead${created === 1 ? "" : "s"} generated. ${skipped ? `${skipped} row${skipped === 1 ? " was" : "s were"} skipped because the company name was blank. ` : ""}Generated records are marked Check data until reviewed.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not generate leads from the Excel file.");
     } finally {
@@ -795,7 +1057,7 @@ function App() {
     setCameraOpen(false);
     const files = cameraFiles;
     setCameraFiles([]);
-    await uploadFiles(files, files.length > 1, true);
+    await uploadFiles(files, files.length > 1, true, true);
   }
 
   async function retryDocument(source: DocumentRecord) {
@@ -834,6 +1096,7 @@ function App() {
       setRawCandidates([]);
       setEditingLead(null);
       setForm(formFromExtracted(fullDocument.extracted_fields || {}));
+      void enrichQrWebsite(fullDocument.extracted_fields || {});
       setReviewedFingerprint("");
       setTab("form");
     } catch (err) {
@@ -929,15 +1192,17 @@ function App() {
       source_document_ids: sourceDocumentIds,
       source_sides: sourceDocumentIds.map((_, index) => index === 0 ? "front" : "back"),
       document_card_index: document?.extracted_fields.cards && document.extracted_fields.cards.length > 1 ? activeCardIndex : null,
-      original_ocr_text: editingLead?.original_ocr_text || textValue(document?.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document?.extracted_fields.original_ocr_text) || null,
+      original_ocr_text: editingLead?.original_ocr_text || localOriginalOcrText || textValue(document?.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document?.extracted_fields.original_ocr_text) || null,
       source_review_confirmed: !needsSourceReview || sourceReviewConfirmed,
     };
+    const idempotencyKey = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     try {
       if (editingLead) {
         await api<Lead>(`/leads/${editingLead.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
         setNotice("Lead updated.");
       } else {
-        await api<Lead>("/leads", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        await api<Lead>("/leads", { method: "POST", headers: { "Content-Type": "application/json", "X-Idempotency-Key": idempotencyKey }, body: JSON.stringify(payload) });
+        await clearLeadDraft(user.id).catch(() => undefined);
         setNotice("Lead saved.");
       }
       if (!editingLead) {
@@ -962,6 +1227,9 @@ function App() {
         await loadScanIssues();
       } else {
         setDocument(null);
+        setLocalOriginalOcrText("");
+        setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; });
+        setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; });
         setEditingLead(null);
         setRawCandidates([]);
         setRawCandidateIndex(0);
@@ -988,7 +1256,13 @@ function App() {
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save lead.");
+      if (!navigator.onLine || (err instanceof TypeError && /fetch/i.test(err.message))) {
+        await enqueueLead(user.id, payload, idempotencyKey).catch(() => undefined);
+        setSyncCount((count) => count + 1);
+        setNotice("Lead saved on this device and queued for synchronization when the connection returns.");
+      } else {
+        setError(err instanceof Error ? err.message : "Could not save lead.");
+      }
     } finally {
       setBusy(false);
     }
@@ -1054,8 +1328,9 @@ function App() {
       <header className="topbar">
         <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setTab("leads"); }}>
           <span className="brand-mark">L</span>
-          <span>Lead Gennie<small>Document to lead</small></span>
+          <span>Lead Gennie<small>{user.full_name} · Document to lead</small></span>
         </a>
+        <button className="button button-secondary auth-logout" type="button" onClick={onLogout}>Log out</button>
       </header>
 
       <main className="page">
@@ -1064,11 +1339,12 @@ function App() {
             <p className="subheading">Scan business documents and keep your contacts in one place.</p></div>
           <div className="upload-actions">
             <button className="button button-secondary" type="button" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraError(""); setCameraOpen(true); }}>Open camera</button>
+            <button className="button button-secondary" type="button" onClick={() => { setQrResult(null); setWebsitePreview(null); setQrCameraError(""); setQrCameraOpen(true); }}>Scan QR</button>
             <label className="button button-primary upload-button"><span aria-hidden="true">＋</span> Upload files
-              <input type="file" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.gif,.pdf,.zip,.txt,.csv,.xlsx" onChange={upload} />
+              <input type="file" multiple accept="image/*,.pdf,.zip,.txt,.csv,.xlsx" onChange={upload} />
             </label>
             <label className="button button-secondary upload-button">Choose folder
-              <input type="file" multiple {...({ webkitdirectory: "" } as Record<string, string>)} accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.gif,.pdf,.zip,.txt,.csv,.xlsx" onChange={upload} />
+              <input type="file" multiple {...({ webkitdirectory: "" } as Record<string, string>)} accept="image/*,.pdf,.zip,.txt,.csv,.xlsx" onChange={upload} />
             </label>
           </div>
         </div>
@@ -1080,6 +1356,7 @@ function App() {
 
         {error && <div className="alert alert-error" role="alert">{error}<button aria-label="Dismiss" onClick={() => setError("")}>×</button></div>}
         {notice && <div className="alert alert-success" role="status">{notice}<button aria-label="Dismiss" onClick={() => setNotice("")}>×</button></div>}
+        {syncCount > 0 && <div className="alert alert-success" role="status">{syncCount} lead{syncCount === 1 ? "" : "s"} waiting to sync. <button className="text-button" onClick={() => void flushQueuedLeads()}>Sync now</button></div>}
         {(pendingDocuments.length > 0 || scanStage) && <div className="scan-progress" role="status"><span className="spinner" />{scanStage || "Preparing scan"}. You will check the details before saving.</div>}
 
         {tab === "leads" ? (
@@ -1120,7 +1397,8 @@ function App() {
             </section>
           </>
         ) : (
-          <section className={`review-layout${document ? " with-source-preview" : ""}`}>
+          <section className={`review-layout${document || localPreviewUrl ? " with-source-preview" : ""}`}>
+            {!document && localPreviewUrl && <aside className="panel source-preview-panel"><div className="source-preview-heading"><span className="eyebrow">LOCAL SOURCE PREVIEW</span><strong>Images remain on this device until Save</strong></div><div className="local-preview-grid">{(localPreviewUrls.length ? localPreviewUrls : [localPreviewUrl]).map((url, index) => <figure key={url}><img src={url} alt={`Locally processed card image ${index + 1}`} /><figcaption>{index === 0 ? "Front" : `Back / image ${index + 1}`}</figcaption></figure>)}</div></aside>}
             {document && <aside className="panel source-preview-panel"><div className="source-preview-heading"><div className="source-preview-topline"><span className="eyebrow">UPLOADED DOCUMENT</span><button type="button" className="button button-secondary source-back-button" onClick={() => setTab("leads")}>← Back to leads</button></div><strong title={document.original_filename}>{document.original_filename}</strong></div>{document.content_type === "application/pdf" ? <iframe title={`Preview of ${document.original_filename}`} src={`${API}/documents/${document.id}/file`} /> : <img src={`${API}/documents/${document.id}/file`} alt={`Uploaded source ${document.original_filename}`} />}</aside>}
             <div className="panel form-panel review-form-panel">
               {document && <div className="source-summary">
@@ -1140,7 +1418,7 @@ function App() {
                 {!!(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text) && <details><summary>Original OCR text</summary><pre style={{ whiteSpace: "pre-wrap" }}>{textValue(document.extracted_fields.cards?.[activeCardIndex]?.original_ocr_text || document.extracted_fields.original_ocr_text)}</pre></details>}
                 {!busy && document.processing_status !== "uploaded" && document.processing_status !== "processing" && !editingLead && <button type="button" className="text-button" onClick={() => void retryDocument(document)}>Re-scan and translate</button>}
               </div>}
-              {!document && !editingLead && <div className="candidate-summary"><span className="eyebrow">{rawCandidates.length ? "RAW DATA REVIEW" : "MANUAL ENTRY"}</span><p>{rawCandidates.length ? `${rawCandidates[rawCandidateIndex]?.source} · Row ${rawCandidates[rawCandidateIndex]?.row} · ${rawCandidateIndex + 1} of ${rawCandidates.length}. Review rows individually or generate the remaining Excel leads at once.` : "Enter company information below, then select Save lead."}</p>{canBulkGenerate && <button type="button" className="button button-primary generate-batch-button" onClick={() => void generateAllExcelLeads()} disabled={busy}>{busy ? "Generating leads…" : `Generate ${rawCandidates.slice(rawCandidateIndex).length} remaining leads in one click`}</button>}</div>}
+              {!document && !editingLead && <div className="candidate-summary"><span className="eyebrow">{rawCandidates.length ? "RAW DATA REVIEW" : localPreviewUrl ? "LOCAL OCR REVIEW" : "MANUAL ENTRY"}</span><p>{rawCandidates.length ? `${rawCandidates[rawCandidateIndex]?.source} · Row ${rawCandidates[rawCandidateIndex]?.row} · ${rawCandidateIndex + 1} of ${rawCandidates.length}. Review rows individually or generate the remaining Excel leads at once.` : localPreviewUrl ? "OCR ran on this device. Review the fields; images remain local until Save." : "Enter company information below, then select Save lead."}</p>{localConflicts.length > 0 && <div className="review-warning"><strong>Conflicting values found across card images:</strong><ul>{localConflicts.map((item) => <li key={item}>{item}</li>)}</ul><p>Review and keep the value that matches the card.</p></div>}{ocrFallbackFiles.length > 0 && <div className="review-warning"><p>Browser OCR could not reliably read this image. It has not been uploaded.</p><div className="form-actions"><button type="button" className="button button-secondary" disabled={busy} onClick={() => void uploadFiles(ocrFallbackFiles, false, false, false)}>Retry locally</button><button type="button" className="button button-primary" disabled={busy} onClick={() => void uploadFiles(ocrFallbackFiles, false, false, true)}>Continue with server OCR</button><button type="button" className="text-button" disabled={busy} onClick={() => { setOcrFallbackFiles([]); setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; }); setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; }); setTab("leads"); }}>Cancel</button></div></div>}{canBulkGenerate && <button type="button" className="button button-primary generate-batch-button" onClick={() => void generateAllExcelLeads()} disabled={busy}>{busy ? "Generating leads…" : `Generate ${rawCandidates.slice(rawCandidateIndex).length} remaining leads in one click`}</button>}</div>}
               <div className="form-heading"><span className="eyebrow">LEAD INFORMATION</span><h2>{editingLead ? editingLead.lead_number : document?.extracted_fields.cards && document.extracted_fields.cards.length > 1 ? `Card ${activeCardIndex + 1} of ${document.extracted_fields.cards.length}` : "Add lead"}</h2><p>{editingLead ? "Correct any details, then save your changes." : "Enter the company information and save the lead."}</p></div>
               <form onSubmit={saveLead}>
                 {fields.map((field) => <label className="field" key={field.key}><span>{field.label}{field.key === "company_name" && <b>Required</b>}</span>
@@ -1154,12 +1432,14 @@ function App() {
                   {!hasOcrText ? <p className="review-warning">Source text is unavailable. Compare every field directly with the original source.</p> : mismatches.length ? <><p className="review-warning">Check these possible mismatches against the original. Correct any errors before saving:</p><ul>{mismatches.map((item) => <li key={item}>{item}</li>)}</ul></> : <p className="review-match">Structured values are consistent with the stored source text. OCR can still misread characters, so compare them with the original source.</p>}
                   <label className="review-confirm"><input type="checkbox" checked={sourceReviewConfirmed} onChange={(event) => setReviewedFingerprint(event.target.checked ? formFingerprint : "")} /><span>I compared the lead details with the available source and corrected any mismatches.</span></label>
                 </section>}
-                <div className="form-actions">{rawCandidates.length > 0 && !editingLead && <button type="button" className="button button-secondary" onClick={() => setTab("leads")}>Back to leads</button>}<button type="button" className="button button-secondary" onClick={() => { setTab("leads"); setDocument(null); setEditingLead(null); setError(""); setBusy(false); }}>Cancel</button><button className="button button-primary" disabled={busy || Boolean(editingLead?.document_id && !document)}>{busy ? "Working…" : editingLead ? "Save changes" : rawCandidates.length > 0 && rawCandidateIndex + 1 < rawCandidates.length ? "Save & continue" : "Save lead"}</button></div>
+                <div className="form-actions">{rawCandidates.length > 0 && !editingLead && <button type="button" className="button button-secondary" onClick={() => setTab("leads")}>Back to leads</button>}<button type="button" className="button button-secondary" onClick={() => { setTab("leads"); setDocument(null); setOcrFallbackFiles([]); setLocalOriginalOcrText(""); setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; }); setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; }); setEditingLead(null); setError(""); setBusy(false); }}>Cancel</button><button className="button button-primary" disabled={busy || Boolean(editingLead?.document_id && !document)}>{busy ? "Working…" : editingLead ? "Save changes" : rawCandidates.length > 0 && rawCandidateIndex + 1 < rawCandidates.length ? "Save & continue" : "Save lead"}</button></div>
               </form>
             </div>
           </section>
         )}
         {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture card images</h2><p>{cameraFiles.length ? `${cameraFiles.length} image${cameraFiles.length === 1 ? "" : "s"} captured. Capture the back side too, then scan.` : "Capture the front side, then optionally capture the back side."}</p><p className="camera-tip">For a sharper scan, use bright even light, hold the phone steady, and fit the whole card inside the frame.</p></div><button className="details-close" aria-label="Close camera" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraOpen(false); }}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraOpen(false); }}>Cancel</button><button className="button button-secondary" onClick={() => void capturePhoto()}>Capture {cameraFiles.length ? "another" : "image"}</button><button className="button button-primary" onClick={() => void finishCameraScan()} disabled={!cameraFiles.length}>Scan {cameraFiles.length || ""} image{cameraFiles.length === 1 ? "" : "s"}</button></div></section></div>}
+        {qrCameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="qr-camera-title"><header><div><span className="eyebrow">QR SCANNER</span><h2 id="qr-camera-title">Scan a QR code</h2><p>Point the rear camera at a QR code. The code will be decoded locally and shown for review.</p></div><button className="details-close" aria-label="Close QR scanner" onClick={() => setQrCameraOpen(false)}>×</button></header><div className="camera-preview"><video ref={qrVideoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{qrCameraError && <p className="camera-error" role="alert">{qrCameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => setQrCameraOpen(false)}>Cancel</button></div></section></div>}
+        {qrResult && <section className="qr-result panel" aria-label="QR result"><div><strong>QR data decoded</strong><p className="muted">{safeText(qrResult.source_text)}</p></div>{safeText(qrResult.website) && <div className="qr-result-actions"><a className="button button-secondary" href={safeText(qrResult.website)} target="_blank" rel="noreferrer">Open website</a><button className="button button-secondary" type="button" onClick={() => void previewQrWebsite()} disabled={busy}>Read public page</button></div>}{websitePreview && <details open><summary>Website preview</summary><p>{websitePreview.source_text || "No readable metadata was found."}</p>{websitePreview.warnings.map((warning) => <p className="camera-error" key={warning}>{warning}</p>)}</details>}</section>}
         {viewingLead && <div className="details-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setViewingLead(null); }}>
           <section className="details-dialog" role="dialog" aria-modal="true" aria-labelledby="details-title">
             <header className="details-heading"><div><span className="eyebrow">LEAD DETAILS</span><h2 id="details-title">{viewingLead.company_name}</h2><p>{viewingLead.lead_number}</p></div><button className="details-close" aria-label="Close details" onClick={() => setViewingLead(null)}>×</button></header>
@@ -1189,4 +1469,35 @@ function App() {
   );
 }
 
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: AuthUser) => void }) {
+  const [mode, setMode] = useState<"login" | "register" | "forgot" | "reset">(new URLSearchParams(window.location.search).has("token") ? "reset" : "login");
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setBusy(true); setError(""); setMessage("");
+    try {
+      if (mode === "login") onAuthenticated(await api<AuthUser>("/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) }));
+      else if (mode === "register") onAuthenticated(await api<AuthUser>("/auth/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ full_name: fullName, email, password }) }));
+      else if (mode === "forgot") setMessage((await api<{ message: string }>("/auth/forgot-password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) })).message);
+      else setMessage((await api<{ message: string }>("/auth/reset-password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: new URLSearchParams(window.location.search).get("token"), password }) })).message);
+    } catch (err) { setError(err instanceof Error ? err.message : "Authentication failed."); } finally { setBusy(false); }
+  }
+  const title = mode === "login" ? "Welcome back" : mode === "register" ? "Create your account" : mode === "forgot" ? "Forgot password" : "Set a new password";
+  return <main className="auth-page"><section className="auth-card"><span className="brand-mark">L</span><p className="eyebrow">LEAD GENNIE</p><h1>{title}</h1><p className="auth-copy">Securely scan, review, and manage your business leads.</p><form onSubmit={submit}>{mode === "register" && <label className="field"><span>Full name</span><input required value={fullName} onChange={(event) => setFullName(event.target.value)} autoComplete="name" /></label>}<label className="field"><span>Email</span><input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" /></label>{mode !== "forgot" && <label className="field"><span>{mode === "reset" ? "New password" : "Password"}</span><input required type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === "login" ? "current-password" : "new-password"} /></label>}<button className="button button-primary auth-submit" disabled={busy}>{busy ? "Please wait…" : mode === "forgot" ? "Send reset instructions" : mode === "reset" ? "Reset password" : mode === "register" ? "Create account" : "Log in"}</button></form>{error && <p className="auth-error" role="alert">{error}</p>}{message && <p className="auth-message" role="status">{message}</p>}<div className="auth-links">{mode === "login" && <><button onClick={() => setMode("forgot")}>Forgot password?</button><button onClick={() => setMode("register")}>Create an account</button></>}{mode !== "login" && <button onClick={() => setMode("login")}>Back to login</button>}</div></section></main>;
+}
+
+function App() {
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [checking, setChecking] = useState(true);
+  useEffect(() => { api<AuthUser>("/auth/me").then(setUser).catch(() => setUser(null)).finally(() => setChecking(false)); }, []);
+  if (checking) return <main className="auth-page"><p>Loading…</p></main>;
+  if (!user) return <AuthScreen onAuthenticated={setUser} />;
+  return <LeadApp user={user} onLogout={() => { void api("/auth/logout", { method: "POST" }).finally(() => setUser(null)); }} />;
+}
+
 export default App;
+

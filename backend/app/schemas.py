@@ -89,6 +89,37 @@ class QRParseRequest(BaseModel):
     payload: str = Field(max_length=10000)
 
 
+class QRWebsitePreviewRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=2000)
+
+
 class ReverseGeocodeRequest(BaseModel):
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
+
+
+class RegisterRequest(BaseModel):
+    full_name: str = Field(min_length=1, max_length=160)
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class UserRead(BaseModel):
+    id: str
+    full_name: str
+    email: str
+    is_verified: bool

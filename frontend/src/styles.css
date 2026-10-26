@@ -16,6 +16,7 @@
 @media(max-width:900px){.review-layout.with-source-preview{grid-template-columns:minmax(0,1fr)}.source-preview-panel{position:static}.source-preview-panel>img,.source-preview-panel>iframe{height:min(52vh,480px)}}
 @media(max-width:700px){.lead-filter-row{grid-template-columns:repeat(2,minmax(0,1fr));padding:12px}.toolbar-actions{justify-content:flex-start}.export-count-field{width:88px}.draft-queue-strip{align-items:flex-start;flex-direction:column}.review-layout.with-source-preview{gap:10px}}
 .generate-batch-button{margin-top:12px;white-space:normal;text-align:center}
+.qr-result{margin:0 0 14px;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;color:#38513f}.qr-result p{margin:6px 0 0;overflow-wrap:anywhere}.qr-result-actions{display:flex;gap:8px;flex-wrap:wrap}.qr-result details{flex-basis:100%;padding-top:8px}.qr-result summary{cursor:pointer;font-weight:600;font-size:12px}.qr-result .button{min-height:34px}
 @media(max-width:420px){.lead-filter-row{grid-template-columns:1fr}.toolbar-actions .button{flex:1}.export-count-field{width:76px}}
 .source-preview-topline{display:flex;align-items:center;justify-content:space-between;gap:10px}.source-back-button{padding:7px 10px;font-size:11px;white-space:nowrap}
 @media(max-width:420px){.source-preview-topline{align-items:flex-start;flex-direction:column}.source-back-button{width:100%}}
@@ -162,6 +163,8 @@ footer { color: #748178; }
   .review-form-panel form > .field, .review-form-panel form > .review-check,
   .review-form-panel form > .form-actions { grid-column: 1; }
 }
+
+.local-preview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-top:12px}.local-preview-grid figure{margin:0;background:#f4f6f3;border:1px solid #e0e7df;border-radius:8px;padding:6px}.local-preview-grid img{width:100%;height:150px;object-fit:contain;display:block}.local-preview-grid figcaption{font-size:10px;color:#687368;text-align:center;padding-top:5px}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }

@@ -21,11 +21,27 @@ from PIL import Image
 
 from backend.app import main
 from backend.app.database import Base
-from backend.app.models import Document, Lead, LeadContact, LeadSourceImage
+from backend.app.models import Document, Lead, LeadContact, LeadIdempotency, LeadSourceImage, User
 from backend.app.schemas import LeadCreate
 
 
 class DocumentReviewFlowTests(unittest.TestCase):
+    def test_lead_idempotency_is_persistent_and_scoped_to_user(self):
+        with self.session_factory() as db:
+            first_user = User(full_name="First", email="first@example.com", normalized_email="first@example.com", password_hash="x")
+            second_user = User(full_name="Second", email="second@example.com", normalized_email="second@example.com", password_hash="x")
+            db.add_all([first_user, second_user])
+            db.commit()
+            db.refresh(first_user)
+            db.refresh(second_user)
+            request = Request({"type": "http", "method": "POST", "path": "/api/leads", "headers": [(b"x-idempotency-key", b"same-key")]})
+            first = main.create_lead(LeadCreate(company_name="Acme"), request, db, first_user)
+            replay = main.create_lead(LeadCreate(company_name="Acme"), request, db, first_user)
+            other = main.create_lead(LeadCreate(company_name="Acme"), request, db, second_user)
+            self.assertEqual(first.id, replay.id)
+            self.assertNotEqual(first.id, other.id)
+            self.assertEqual(db.scalar(select(func.count()).select_from(LeadIdempotency)), 2)
+
     def test_text_preview_preserves_original_and_multiple_contacts_without_company(self):
         source = 'Contacts\r\n+91 89995 21798\r\n+91 74994 22904\r\nपुणे\r\n'
         with tempfile.SpooledTemporaryFile() as stream:
