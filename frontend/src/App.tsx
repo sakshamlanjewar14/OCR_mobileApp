@@ -8,7 +8,7 @@ import { parseQrLocally, recognizeCard } from "./clientOcr";
 // Vite environment values are baked into the production bundle. Keep a
 // working hosted fallback so a missing VITE_API_URL cannot point a deployed
 // phone app at the Vercel frontend host on port 8000.
-const API = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "/api" : "https://ocr-mobileapp.onrender.com/api");
+const API = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "/api" : "https://ocr-mobileapp-3.onrender.com/api");
 
 type Lead = {
   id: string;
