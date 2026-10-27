@@ -48,6 +48,7 @@ except ImportError:  # resource is unavailable on Windows development hosts.
 from .database import Base, SessionLocal, engine, get_db
 from .models import AuthSession, Document, Lead, LeadContact, LeadIdempotency, LeadSourceImage, PasswordResetToken, User
 from .ocr import OCRUnavailableError, _parse_fields, extract_fields
+from . import paddle_ocr
 from .qr import parse_qr_payload
 from .geocoding import reverse_geocode
 from .schemas import (DocumentRead, DocumentStatusRead, DocumentStatusRequest, ForgotPasswordRequest, LeadCreate,
@@ -404,6 +405,8 @@ def initialize_database() -> None:
     translation_dir = os.getenv("TRANSLATION_MODEL_DIR", "").strip()
     if translation_dir and Path(translation_dir).is_dir():
         threading.Thread(target=warm_translation_model, name="ocr-translation-warmup", daemon=True).start()
+    if paddle_ocr.enabled():
+        threading.Thread(target=paddle_ocr.warm, name="paddle-ocr-warmup", daemon=True).start()
 
 
 
@@ -742,7 +745,7 @@ def readiness() -> dict[str, str]:
         logger.warning("readiness_failed component=database")
     try:
         from .ocr import _tesseract_available, _uses_windows_ocr_fallback
-        ocr_ready = _tesseract_available() or _uses_windows_ocr_fallback()
+        ocr_ready = paddle_ocr.available() or _tesseract_available() or _uses_windows_ocr_fallback()
     except Exception:
         ocr_ready = False
     if not ocr_ready:

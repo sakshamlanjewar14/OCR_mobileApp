@@ -19,6 +19,7 @@ except ImportError:  # QR scanning remains optional for lightweight local instal
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageStat
 from .translation import translate_document_text, latin_name, latinize_document_text, model_initialization_time_ms
 from .qr import parse_qr_payload
+from . import paddle_ocr
 
 
 configured_tesseract = os.getenv("TESSERACT_CMD", "").strip()
@@ -122,6 +123,14 @@ def _windows_ocr(image: Image.Image) -> str:
 
 
 def _read_image(image: Image.Image) -> str:
+    if paddle_ocr.enabled():
+        try:
+            text, _heights = paddle_ocr.read(image)
+            if text.strip():
+                return text
+        except Exception:
+            # Keep the existing Tesseract path as a safe engine fallback.
+            pass
     try:
         return pytesseract.image_to_string(image, lang=_ocr_languages())
     except pytesseract.TesseractError:
@@ -135,6 +144,16 @@ def _read_image(image: Image.Image) -> str:
 
 def _read_image_with_layout(image: Image.Image, languages: str | None = None) -> tuple[str, dict[str, int]]:
     """Read OCR lines and their text heights so prominent brand text can be preferred."""
+    if paddle_ocr.enabled() and (languages is None or languages == os.getenv("PADDLEOCR_LANGUAGES", "en")):
+        try:
+            text, heights = paddle_ocr.read(image, language=languages)
+            if text.strip():
+                return text, heights
+        except Exception:
+            # Tesseract remains available for malformed images or missing
+            # Paddle runtime/model files.
+            pass
+
     # Windows OCR is the local fallback when Tesseract is not installed. It
     # cannot provide word boxes, so avoid calling it again for synthetic page
     # segmentation passes.

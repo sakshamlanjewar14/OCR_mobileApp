@@ -5,7 +5,8 @@ FROM python:3.12-slim
 ARG INSTALL_TRANSLATION=0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PADDLE_PDX_CACHE_HOME=/opt/paddle-cache
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -13,6 +14,7 @@ RUN apt-get update \
         tesseract-ocr-eng \
         tesseract-ocr-hin \
         tesseract-ocr-mar \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Fail the image build early if the OCR executable or the required fast
@@ -24,6 +26,7 @@ RUN tesseract --version >/dev/null \
 # build. No runtime or external model download is required.
 
 WORKDIR /app
+RUN mkdir -p /opt/paddle-cache
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
