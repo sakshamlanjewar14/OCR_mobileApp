@@ -826,7 +826,7 @@ def _public_url(url: str) -> str:
         raise HTTPException(status_code=400, detail="The website host could not be resolved.") from exc
     for address in addresses:
         ip = ipaddress.ip_address(address.split("%", 1)[0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        if not ip.is_global:
             raise HTTPException(status_code=400, detail="Private and local network URLs are not allowed.")
     return candidate
 
@@ -858,27 +858,49 @@ def qr_website_preview(payload: QRWebsitePreviewRequest, user: User = Depends(re
     except Exception:
         raise HTTPException(status_code=502, detail="The website content could not be parsed safely.")
     fields: dict[str, object] = {"website": url}
-    # Many modern sites render their content in JavaScript and expose only a
-    # useful title in the initial HTML. Use a conservative title pattern for
-    # the company name; never treat a person or address as a company guess.
-    if parser.title:
-        title_match = re.search(r"\bwith\s+(.+?)\s*:\s*", parser.title, re.IGNORECASE)
-        if title_match:
-            fields["company_name"] = title_match.group(1).strip(" -|:")[:255]
-        elif "|" in parser.title:
-            fields["company_name"] = parser.title.split("|", 1)[0].strip()[:255]
-        if not parser.description:
-            fields["business_description"] = parser.title[:500]
+    # Only an explicitly typed organization supplies its name/address. A page
+    # title alone may be a login prompt, article or person's name.
+    for block in parser.json_ld[:10]:
+        try: structured = json.loads(block)
+        except (ValueError, TypeError): continue
+        nodes = structured if isinstance(structured, list) else [structured]
+        for node in nodes[:50]:
+            if isinstance(node, dict) and isinstance(node.get("@graph"), list):
+                nodes = [*nodes, *node["@graph"]][:50]
+        for node in nodes[:50]:
+            if not isinstance(node, dict): continue
+            types = node.get("@type", [])
+            if isinstance(types, str): types = [types]
+            if not any(kind in {"Organization", "LocalBusiness", "Corporation", "ProfessionalService", "Store", "Electrician", "HVACBusiness"} for kind in types): continue
+            if isinstance(node.get("name"), str): fields.setdefault("company_name", node["name"][:255])
+            address = node.get("address")
+            if isinstance(address, dict):
+                parts = [address.get(key) for key in ("streetAddress", "addressLocality", "addressRegion", "postalCode", "addressCountry")]
+                text_address = ", ".join(str(part).strip() for part in parts if isinstance(part, (str, int)) and str(part).strip())
+                if text_address: fields.setdefault("company_address", text_address[:2000])
+            elif isinstance(address, str): fields.setdefault("company_address", address[:2000])
+            for key, prefix, target, alias in [("telephone", "tel:", "contact_numbers", "contacts"), ("email", "mailto:", "email_addresses", "emails")]:
+                values = node.get(key, [])
+                if isinstance(values, str): values = [values]
+                if isinstance(values, list):
+                    for value in values[:20]:
+                        if not isinstance(value, str): continue
+                        parsed_value = parse_qr_payload(prefix + value.removeprefix(prefix))
+                        fields[target] = list(dict.fromkeys([*fields.get(target, []), *parsed_value.get(alias, [])]))
     for link in parser.links:
         absolute = urllib.parse.urljoin(url, link)
         parsed = parse_qr_payload(absolute)
         for key in ("facebook_link", "instagram_link", "whatsapp_link"):
             if parsed.get(key): fields.setdefault(key, parsed[key])
+        for key, alias in (("contact_numbers", "contacts"), ("email_addresses", "emails")):
+            if parsed.get(alias): fields[key] = list(dict.fromkeys([*fields.get(key, []), *parsed[alias]]))
     if parser.description: fields["business_description"] = parser.description
     source_text = " ".join(part for part in (parser.title, parser.description) if part).strip()
     if not fields.get("facebook_link") and not fields.get("instagram_link") and not fields.get("whatsapp_link") and not fields.get("company_name") and not parser.description:
         return {"url": url, "fields": fields, "source_text": source_text, "warnings": ["Only the website URL could be verified. Review other fields manually."]}
-    return {"url": url, "fields": fields, "source_text": source_text, "warnings": []}
+    return {"url": url, "fields": fields, "source_text": source_text,
+            "warnings": ["Public website suggestions require review against the card."],
+            "field_sources": {key: {"source_type": "website", "source_text": source_text or url, "confidence": "medium", "needsReview": True} for key in fields}}
 
 
 @app.post("/api/geocoding/reverse")

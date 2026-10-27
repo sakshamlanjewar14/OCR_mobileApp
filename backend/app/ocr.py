@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 import unicodedata
+from contextvars import ContextVar
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageSta
 from .translation import translate_document_text, latin_name, latinize_document_text, model_initialization_time_ms
 from .qr import parse_qr_payload
 from . import paddle_ocr
+
+_last_engine = ContextVar("ocr_engine", default="unmeasured")
 
 
 configured_tesseract = os.getenv("TESSERACT_CMD", "").strip()
@@ -127,11 +130,13 @@ def _read_image(image: Image.Image) -> str:
         try:
             text, _heights = paddle_ocr.read(image)
             if text.strip():
+                _last_engine.set("paddleocr")
                 return text
         except Exception:
             # Keep the existing Tesseract path as a safe engine fallback.
             pass
     try:
+        _last_engine.set("tesseract")
         return pytesseract.image_to_string(image, lang=_ocr_languages())
     except pytesseract.TesseractError:
         # Missing Hindi/Marathi traineddata should not make English card scanning fail.
@@ -144,10 +149,11 @@ def _read_image(image: Image.Image) -> str:
 
 def _read_image_with_layout(image: Image.Image, languages: str | None = None) -> tuple[str, dict[str, int]]:
     """Read OCR lines and their text heights so prominent brand text can be preferred."""
-    if paddle_ocr.enabled() and (languages is None or languages == os.getenv("PADDLEOCR_LANGUAGES", "en")):
+    if paddle_ocr.enabled():
         try:
             text, heights = paddle_ocr.read(image, language=languages)
             if text.strip():
+                _last_engine.set("paddleocr")
                 return text, heights
         except Exception:
             # Tesseract remains available for malformed images or missing
@@ -158,9 +164,11 @@ def _read_image_with_layout(image: Image.Image, languages: str | None = None) ->
     # cannot provide word boxes, so avoid calling it again for synthetic page
     # segmentation passes.
     if _uses_windows_ocr_fallback():
+        _last_engine.set("windows_ocr")
         return _windows_ocr(image), {}
 
     selected_languages = languages or _ocr_languages()
+    _last_engine.set("tesseract")
 
     def read(config: str = "") -> tuple[str, dict[str, int]]:
         try:
@@ -292,14 +300,14 @@ def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
     # image remains the source shown to the user and used for QR decoding.
     def quality(value: str) -> int:
         letters = len(re.findall(r"[A-Za-z]{2,}", value))
-        identifiers = 3 * len(re.findall(r"@|(?:https?://|www\\.)|\\+?\\d(?:[\\s().-]*\\d){6,}", value, re.I))
-        indic = len(re.findall(r"[\\u0900-\\u097F]", value))
-        noise = len(re.findall(r"[^\\w\\s@./:+-]", value))
+        identifiers = 3 * len(re.findall(r"@|(?:https?://|www\.)|\+?\d(?:[\s().-]*\d){6,}", value, re.I))
+        indic = len(re.findall(r"[\u0900-\u097F]", value))
+        noise = len(re.findall(r"[^\w\s@./:+-]", value))
         return letters + identifiers + indic - min(noise, 12)
 
     gray_stats = ImageStat.Stat(ImageOps.grayscale(image))
     low_contrast_capture = 5 < (gray_stats.extrema[0][1] - gray_stats.extrema[0][0]) < 150
-    if low_contrast_capture and (quality(text) < 12 or not re.search(r"@|(?:https?://|www\\.)|\\+?\\d(?:[\\s().-]*\\d){6,}", text, re.I)):
+    if low_contrast_capture and (quality(text) < 12 or not re.search(r"@|(?:https?://|www\.)|\+?\d(?:[\s().-]*\d){6,}", text, re.I)):
         enhanced = ImageOps.autocontrast(ImageOps.grayscale(image), cutoff=1)
         enhanced = enhanced.filter(ImageFilter.UnsharpMask(radius=1.1, percent=125, threshold=3)).convert("RGB")
         enhanced_text, enhanced_heights = _read_image_with_layout(enhanced)
@@ -331,8 +339,9 @@ def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
     # expensive eng+hin+mar run on every card while retaining Hindi/Marathi
     # support.  Explicit TESSERACT_LANGUAGES values remain respected for
     # deployments that intentionally choose a fixed language set.
-    if _ocr_languages() == "eng" and not any(
-        fields.get(key) for key in ("company_name", "owner_name", "contact_numbers", "email_addresses", "website")
+    identity_missing = not any(fields.get(key) for key in ("company_name", "owner_name", "company_address"))
+    if _ocr_languages() == "eng" and len(fields.get("contact_numbers") or []) < 3 and (re.search(r"[\u0900-\u097f]", text) or identity_missing) and not any(
+        fields.get(key) for key in ("company_name", "owner_name", "company_address")
     ):
         indic_text, indic_heights = _read_image_with_layout(image, languages="hin+mar")
         if quality(indic_text) > quality(text):
@@ -743,7 +752,7 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
         for social_key in ("facebook_link", "instagram_link", "whatsapp_link"):
             if parsed_url.get(social_key):
                 social_links.setdefault(social_key, str(parsed_url[social_key]))
-        if not any(parsed_url.get(key) for key in ("facebook_link", "instagram_link", "whatsapp_link")) and website is None:
+        if parsed_url.get("website") and website is None:
             website = candidate_url
     # OCR sometimes drops the dot before a familiar TLD (for example,
     # ``name@companycom``). Repair it only when the candidate domain exactly
@@ -1176,54 +1185,59 @@ def _parse_fields(text: str, line_heights: dict[str, int] | None = None) -> dict
 
 
 def _decode_qr_payloads(image: Image.Image) -> list[str]:
-    """Decode all visible QR codes without opening their URLs."""
+    """Decode without network access; bound frame size and recovery crops."""
     if cv2 is None or np is None:
         return []
-    try:
-        detector = cv2.QRCodeDetector()
-        pixels = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
-        decoded: list[str] = []
-        ok, values, _, _ = detector.detectAndDecodeMulti(pixels)
-        if ok and values is not None:
-            decoded.extend(str(value).strip() for value in values if str(value).strip())
-        # Printed QR codes can be detected at native size while decoding fails
-        # because the modules occupy only a few pixels. Try bounded enlargements
-        # before giving up; this handles rotated phone photos without sending a
-        # second OCR request or retaining the source image.
-        if not decoded and max(pixels.shape[:2]) < 2600:
-            for scale in (2, 3, 4):
-                enlarged = cv2.resize(pixels, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                ok, values, _, _ = detector.detectAndDecodeMulti(enlarged)
-                if ok and values is not None:
-                    decoded.extend(str(value).strip() for value in values if str(value).strip())
-                if decoded:
-                    pixels = enlarged
-                    break
-                value, _, _ = detector.detectAndDecode(enlarged)
-                if value and value.strip():
-                    decoded.append(value.strip())
-                    pixels = enlarged
-                    break
-        if not decoded:
-            value, _, _ = detector.detectAndDecode(pixels)
-            if value and value.strip():
-                decoded.append(value.strip())
-        return list(dict.fromkeys(decoded))
-    except (cv2.error, ValueError, TypeError):
-        return []
+    rgb = image.convert("RGB")
+    rgb.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
+    pixels = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
+    detector = cv2.QRCodeDetector()
+    decoded = []
 
+    def scan(candidate):
+        try:
+            ok, values, _, _ = detector.detectAndDecodeMulti(candidate)
+            if ok and values is not None:
+                decoded.extend(value.strip() for value in values if value and value.strip())
+            else:
+                value, _, _ = detector.detectAndDecode(candidate)
+                if value and value.strip(): decoded.append(value.strip())
+        except (cv2.error, ValueError, TypeError):
+            pass
+
+    scan(pixels)
+    if not decoded and max(pixels.shape[:2]) < 1000:
+        scan(cv2.resize(pixels, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
+    # A successful frame can still contain additional codes. Eight overlapping
+    # crops recover small codes without upscaling the entire photo fourfold.
+    h, w = pixels.shape[:2]
+    tw, th = max(1, round(w * .55)), max(1, round(h * .3))
+    for y in (round((h - th) * row / 3) for row in range(4)):
+        for x in (0, w - tw):
+            crop = pixels[y:y + th, x:x + tw]
+            scan(crop)
+    return list(dict.fromkeys(decoded))
 
 def _merge_qr_fields(fields: dict[str, object], payloads: list[str]) -> dict[str, object]:
+    payloads = list(dict.fromkeys(payloads))
     if not payloads:
         fields["field_sources"] = _field_source_evidence(fields)
         return fields
     merged = dict(fields)
     parsed = [parse_qr_payload(payload) for payload in payloads]
+    if len(payloads) > 1:
+        merged["qr_payloads"] = payloads
+        merged["qr_data"] = parsed
+        merged["review_warnings"] = [*list(fields.get("review_warnings") or []), "Several QR codes found. Select the intended code; contact values from different codes were not combined."]
+        merged["field_sources"] = _field_source_evidence(merged)
+        return merged
     for key in ("company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"):
         values = [str(item[key]).strip() for item in parsed if item.get(key) and str(item[key]).strip()]
         # Structured QR payloads are explicit contact data; prefer them over
         # an ambiguous OCR guess when both sources contain a value.
         if values:
+            if merged.get(key) and str(merged[key]).strip() != values[0]:
+                merged.setdefault("review_warnings", []).append(f"QR and printed card disagree for {key.replace('_', ' ')}. Compare both sources before saving.")
             merged[key] = values[0]
     for key, result_key in (("contact_numbers", "contacts"), ("email_addresses", "emails")):
         existing = list(merged.get(key) or [])
@@ -1247,6 +1261,7 @@ def _field_source_evidence(fields: dict[str, object]) -> dict[str, dict[str, str
         "company_address": "company_address", "website": "website", "facebook_link": "facebook_link",
         "instagram_link": "instagram_link", "whatsapp_link": "whatsapp_link",
         "contact_numbers": "contacts", "email_addresses": "emails",
+        "business_description": "business_description",
     }
     evidence: dict[str, dict[str, str]] = {}
     for key, qr_key in qr_keys.items():
@@ -1288,8 +1303,11 @@ def _field_source_evidence(fields: dict[str, object]) -> dict[str, dict[str, str
             "source_text": match or "",
             # OCR line matching proves provenance, not visual recognition
             # confidence; request a quick check against the image.
-            "confidence": "review",
+            "confidence": "medium" if match else "low",
         }
+    for key, item in evidence.items():
+        item.update({"value": fields.get(key), "sourceText": item["source_text"],
+                     "sourceType": item["source_type"].lower(), "needsReview": True})
     return evidence
 
 
@@ -1452,27 +1470,12 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
         fields = english
         fields["translation_message"] = "Converted to English locally. Names use Latin-letter transliteration; check spelling and every field against the original before saving."
     elif re.search(r"[\u0900-\u097f]", original_text):
-        # A production server may have Tesseract language data but not the
-        # optional 2 GB translation model. Keep the review usable and prevent
-        # mixed-script values from entering structured fields by using a
-        # Latin-only transcript as a safe fallback. The untouched OCR remains
-        # available in original_ocr_text.
-        latin_text = latinize_document_text(original_text)
-        if latin_text and not re.search(r"[\u0900-\u097f]", latin_text):
-            latin_fields = _parse_fields(latin_text, line_heights)
-            for key in ("contact_numbers", "contact_number", "email_addresses", "email", "website"):
-                latin_fields[key] = fields.get(key)
-            if not fields.get("company_name"):
-                latin_fields["company_name"] = None
-            if not fields.get("owner_name"):
-                latin_fields["owner_name"] = None
-            fields = latin_fields
-            fields["translation_message"] = (
-                "Hindi/Marathi business text was transliterated to Latin because semantic translation is unavailable. "
-                "Check names and address before saving."
-                if status != "unavailable" else
-                "English translation is unavailable because the model is not installed; the preview uses a Latin-only transliteration/cleaned transcript. Verify names and address before saving."
-            )
+        # Keep original-script evidence, but do not call transliteration English.
+        for key in ("company_name", "owner_name", "designation", "business_description", "company_address"):
+            if re.search(r"[\u0900-\u097f]", str(fields.get(key) or "")):
+                fields[key] = None
+        fields["translation_message"] = "English translation is unavailable or unverified. Original Hindi/Marathi text is preserved; enter English names and address after review."
+        fields.setdefault("review_warnings", []).append(fields["translation_message"])
     contaminated_identity_fields = []
     for key in ("company_name", "owner_name", "designation"):
         value = str(fields.get(key) or "")
@@ -1511,4 +1514,11 @@ def _fields_from_ocr_text(original_text: str, line_heights: dict[str, int] | Non
     processing_times["translation_inference_ms"] = max(0, translation_ms - model_init_ms)
     processing_times["field_extraction_ms"] = max(0, round((time.perf_counter() - extraction_started) * 1000) - translation_ms)
     fields["processing_times_ms"] = processing_times
+    fields["ocr_engine"] = _last_engine.get()
+    fields["ocr_models"] = paddle_ocr.diagnostics()
+    evidence = _field_source_evidence(fields)
+    for item in evidence.values():
+        item["needsReview"] = True
+        if item.get("confidence") not in {"high", "medium", "low"}: item["confidence"] = "low"
+    fields["field_sources"] = evidence
     return fields

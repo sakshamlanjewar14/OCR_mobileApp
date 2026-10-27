@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "tsc -b && vite build"
+    "build": "tsc -b && vite build",
+    "test": "node --test tests/qr*.test.cjs"
   },
   "dependencies": {
     "jsqr": "^1.4.0",

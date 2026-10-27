@@ -1,3 +1,4 @@
+import { parseQrPayload as parseQrLocally } from "./qrPayload";
 import jsQR from "jsqr";
 
 export type ClientExtractedFields = {
@@ -84,23 +85,6 @@ export async function recognizeCard(file: Blob, onProgress?: (message: string) =
   // Decode QR before starting the heavier OCR worker. This makes QR-only
   // uploads immediate and still lets normal cards continue through OCR.
   const qrPayloads = await detectQrPayloads(file).catch(() => []);
-  let qrFields: ClientExtractedFields | null = null;
-  for (const payload of qrPayloads) {
-    const qr = parseQrLocally(payload);
-    qrFields = qrFields || { raw_text: "", original_ocr_text: "", field_sources: {} };
-    for (const key of ["company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
-      if (qr[key] && !qrFields[key]) qrFields[key] = qr[key] as string;
-    }
-    qrFields.contact_numbers = [...new Set([...(qrFields.contact_numbers || []), ...(qr.contact_numbers || [])])];
-    qrFields.email_addresses = [...new Set([...(qrFields.email_addresses || []), ...(qr.email_addresses || [])])];
-    qrFields.raw_text = [qrFields.raw_text, qr.source_text].filter(Boolean).join("\n");
-    qrFields.field_sources = { ...(qrFields.field_sources || {}), ...(qr.field_sources || {}) };
-  }
-  if (qrFields && (qrFields.company_name || qrFields.owner_name || qrFields.website || qrFields.contact_numbers?.length || qrFields.email_addresses?.length)) {
-    qrFields.qr_payloads = qrPayloads;
-    onProgress?.("QR code decoded");
-    return qrFields;
-  }
   const worker = await getWorker("eng", onProgress);
   if (!worker) throw new Error("Browser OCR worker is unavailable.");
   const result = await withTimeout(worker.recognize(file, { logger: (message) => onProgress?.(`${message.status || "Reading card"}${typeof message.progress === "number" ? ` ${Math.round(message.progress * 100)}%` : ""}`) }), 45_000, "Browser OCR timed out. Retry locally or choose server OCR.");
@@ -138,7 +122,8 @@ async function detectQrPayloads(file: Blob): Promise<string[]> {
       const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
       const results = await withTimeout(detector.detect(bitmap), 2_000, "QR detection timed out");
       const nativeValues = [...new Set(results.map((item) => item.rawValue?.trim()).filter((item): item is string => Boolean(item)))];
-      if (nativeValues.length) return nativeValues;
+      if (nativeValues.length > 1) return nativeValues;
+      if (nativeValues.length) return [...new Set([...nativeValues, ...decodeQrWithJsQr(bitmap)])];
       } catch { /* Unsupported native formats must not disable local decoding. */ }
     }
     return decodeQrWithJsQr(bitmap);
@@ -178,10 +163,10 @@ function decodeQrWithJsQr(source: CanvasImageSource): string[] {
     if (decoded?.data.trim()) values.add(decoded.data.trim());
     // Several codes in a frame can confuse the single-code locator. Scan
     // overlapping regions at useful resolution without enlarging the frame.
-    if (!values.size) {
-      const tileWidth = Math.ceil(canvas.width * 0.65);
-      const tileHeight = Math.ceil(canvas.height * 0.5);
-      for (const y of [0, Math.floor((canvas.height - tileHeight) / 2), canvas.height - tileHeight]) {
+    {
+      const tileWidth = Math.ceil(canvas.width * 0.55);
+      const tileHeight = Math.ceil(canvas.height * 0.3);
+      for (const y of [0, 1, 2, 3].map(row => Math.round((canvas.height - tileHeight) * row / 3))) {
         for (const x of [0, canvas.width - tileWidth]) {
           const tile = context.getImageData(x, y, tileWidth, tileHeight);
           const found = jsQR(tile.data, tile.width, tile.height, { inversionAttempts: "attemptBoth" });
@@ -211,36 +196,4 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
   }
 }
 
-export function parseQrLocally(payload: string): Partial<ClientExtractedFields> & { source_text: string; website?: string } {
-  const value = payload.trim();
-  const result: Partial<ClientExtractedFields> & { source_text: string; website?: string } = { source_text: value };
-  const emails = [...value.matchAll(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)].map((match) => match[0].toLowerCase());
-  const phones = [...value.matchAll(/(?<!\d)\+?\d(?:[\s().-]*\d){6,14}(?!\d)/g)].map((match) => match[0].trim());
-  const urls = [...value.matchAll(/https?:\/\/[^\s;,]+/gi)].map((match) => match[0].replace(/[),.;]+$/, ""));
-  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const get = (key: string) => lines.find((line) => new RegExp(`^${key}[:;]`, "i").test(line))?.replace(new RegExp(`^${key}[:;]`, "i"), "").split(";")[0].trim() || "";
-  result.email_addresses = emails;
-  result.contact_numbers = phones;
-  result.website = urls[0] || undefined;
-  if (/^BEGIN:VCARD/i.test(value)) {
-    result.owner_name = get("FN") || get("N") || null;
-    result.company_name = get("ORG") || null;
-    result.company_address = get("ADR")?.replace(/;/g, ", ") || null;
-    result.designation = get("TITLE") || null;
-    result.website = get("URL") || result.website;
-  } else if (/^MECARD:/i.test(value)) {
-    result.owner_name = get("N") || null;
-    result.company_name = get("ORG") || null;
-    result.company_address = get("ADR") || null;
-    result.website = get("URL") || result.website;
-  }
-  result.raw_text = lines.join("\n");
-  result.field_sources = {};
-  for (const key of ["company_name", "owner_name", "designation", "company_address", "website"] as const) {
-    const value = result[key];
-    if (typeof value === "string" && value) result.field_sources[key] = { source_type: "qr", source_text: value, confidence: "high" };
-  }
-  if (emails.length) result.field_sources.email_addresses = { source_type: "qr", source_text: emails.join("; "), confidence: "high" };
-  if (phones.length) result.field_sources.contact_numbers = { source_type: "qr", source_text: phones.join("; "), confidence: "high" };
-  return result;
-}
+export { parseQrPayload as parseQrLocally } from "./qrPayload";

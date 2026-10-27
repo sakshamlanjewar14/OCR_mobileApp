@@ -455,6 +455,8 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const [syncCount, setSyncCount] = useState(0);
   const draftLoadedRef = useRef(false);
   const [qrResult, setQrResult] = useState<QRResult | null>(null);
+  const [qrChoices, setQrChoices] = useState<string[]>([]);
+  const qrChoicesRef = useRef<string[]>([]);
   const [websitePreview, setWebsitePreview] = useState<WebsitePreview | null>(null);
   const [batchAsOneLead, setBatchAsOneLead] = useState(false);
   const [sourceDocumentIds, setSourceDocumentIds] = useState<string[]>([]);
@@ -580,30 +582,22 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
         if (qrVideoRef.current) { qrVideoRef.current.srcObject = stream; void qrVideoRef.current.play(); }
         stopScanning = startQrScanLoop({
           ready: () => Boolean(!cancelled && qrVideoRef.current && qrVideoRef.current.readyState >= 2 && qrVideoRef.current.videoWidth),
-          nativeScan: detector ? async () => (await detector!.detect(qrVideoRef.current!)).find((item) => item.rawValue?.trim())?.rawValue : undefined,
-          fallbackScan: () => decodeQrFromVideo(qrVideoRef.current!)[0],
+          nativeScan: detector ? async () => {
+            const values = (await detector!.detect(qrVideoRef.current!)).map(item => item.rawValue || "").filter(Boolean);
+            return values.length === 1 ? [...new Set([...values, ...decodeQrFromVideo(qrVideoRef.current!)])] : values;
+          } : undefined,
+          fallbackScan: () => decodeQrFromVideo(qrVideoRef.current!),
+          onResults: (values) => {
+            stream.getTracks().forEach(track => track.stop());
+            setQrCameraOpen(false);
+            presentQrChoices(values);
+            if (values.length === 1) acceptQrPayload(values[0]);
+            else setNotice("Several QR codes found. Choose the company or contact code below.");
+          },
           onResult: (value) => {
               stream.getTracks().forEach((track) => track.stop());
               setQrCameraOpen(false);
-              const parsed = parseQrLocally(value) as QRResult;
-              setQrResult(parsed);
-              setWebsitePreview(null);
-              setForm((current) => ({
-                ...current,
-                company_name: current.company_name || safeText(parsed.company_name),
-                owner_name: current.owner_name || safeText(parsed.owner_name),
-                designation: current.designation || safeText(parsed.designation),
-                company_address: current.company_address || safeText(parsed.company_address),
-                website: current.website || safeText(parsed.website),
-                facebook_link: current.facebook_link || safeText(parsed.facebook_link),
-                instagram_link: current.instagram_link || safeText(parsed.instagram_link),
-                whatsapp_link: current.whatsapp_link || safeText(parsed.whatsapp_link),
-                contact_numbers: stringValues([...current.contact_numbers, ...((parsed.contact_numbers || parsed.contacts || []) as string[])]),
-                email_addresses: stringValues([...current.email_addresses, ...((parsed.email_addresses || parsed.emails || []) as string[])]),
-                raw_text: current.raw_text || safeText(parsed.source_text),
-              }));
-              setTab("form");
-              setNotice("QR code decoded. Review the extracted fields before saving.");
+              presentQrChoices([value]); acceptQrPayload(value);
           },
         });
       })
@@ -625,49 +619,66 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
       setWebsitePreview(result);
       setForm((current) => ({
         ...current,
+        company_name: current.company_name || safeText(result.fields.company_name),
+        owner_name: current.owner_name || safeText(result.fields.owner_name),
+        designation: current.designation || safeText(result.fields.designation),
+        company_address: current.company_address || safeText(result.fields.company_address),
+        contact_numbers: stringValues([...current.contact_numbers, ...stringValues(result.fields.contact_numbers as string[])]),
+        email_addresses: stringValues([...current.email_addresses, ...stringValues(result.fields.email_addresses as string[])]),
         business_description: current.business_description || safeText(result.fields.business_description),
         facebook_link: current.facebook_link || safeText(result.fields.facebook_link),
         instagram_link: current.instagram_link || safeText(result.fields.instagram_link),
         whatsapp_link: current.whatsapp_link || safeText(result.fields.whatsapp_link),
       }));
-      setNotice(result.warnings.length ? result.warnings.join(" ") : "Website metadata loaded. Review it before saving.");
+      setNotice(["Website suggestions require review; existing card values were preserved.", ...result.warnings].join(" "));
     } catch (err) { setError(err instanceof Error ? err.message : "Could not read the public website."); }
     finally { setBusy(false); }
   }
 
-  async function enrichQrWebsite(extracted: ExtractedLeadFields) {
-    const payload = extracted.qr_payloads?.find((item) => /^https?:\/\//i.test(item));
-    const url = payload || safeText(extracted.website);
-    if (!url) return;
+  async function uploadQrImage(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setQrCameraOpen(false);
+    setError("");
     try {
-      const parsed = payload ? await api<QRResult>("/qr/parse", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ payload }) }) : { website: url };
-      setQrResult(parsed);
-      const result = await api<WebsitePreview>("/qr/website-preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: safeText(parsed.website) || url }) });
-      setWebsitePreview(result);
-      const websiteFields = result.fields;
-      // A website QR is authoritative only for values present on that public
-      // page. Keep the full OCR transcript below the form, but do not leave
-      // review-only OCR guesses (such as a misread owner/address) in fields.
-      setForm((current) => ({
-        ...current,
-        company_name: safeText(websiteFields.company_name),
-        owner_name: safeText(websiteFields.owner_name),
-        designation: safeText(websiteFields.designation),
-        business_description: safeText(websiteFields.business_description),
-        company_address: safeText(websiteFields.company_address),
-        website: safeText(websiteFields.website) || url,
-        facebook_link: safeText(websiteFields.facebook_link),
-        instagram_link: safeText(websiteFields.instagram_link),
-        whatsapp_link: safeText(websiteFields.whatsapp_link),
-        contact_numbers: Array.isArray(websiteFields.contact_numbers) ? websiteFields.contact_numbers.filter((value): value is string => typeof value === "string") : [],
-        email_addresses: Array.isArray(websiteFields.email_addresses) ? websiteFields.email_addresses.filter((value): value is string => typeof value === "string") : [],
-      }));
-      setNotice(result.warnings.length ? result.warnings.join(" ") : "QR website data loaded. Review the fields before saving.");
-    } catch {
-      // Keep the QR URL and OCR transcript available for manual review when
-      // the site is client-rendered, blocked, or temporarily unavailable.
-      setNotice("The QR website could not expose structured public contact data. Review the URL and source text manually.");
+      const values = await scanQrImage(file);
+      if (!values.length) throw new Error("No readable QR found. Try a sharper, closer photo with the full code visible.");
+      presentQrChoices(values);
+      if (values.length === 1) acceptQrPayload(values[0]);
+      else setNotice("Several QR codes found. Choose one below.");
+    } catch (err) { setError(err instanceof Error ? err.message : "Could not decode QR image."); }
+  }
+
+  function presentQrChoices(payloads: string[]) {
+    const choices = [...new Set([...qrChoicesRef.current, ...payloads])];
+    qrChoicesRef.current = choices;
+    setQrChoices(choices);
+    setWebsitePreview(null);
+    if (choices.length === 1) setQrResult(parseQrLocally(choices[0]) as QRResult);
+    else setQrResult(null);
+  }
+
+  function acceptQrPayload(value: string) {
+    const parsed = parseQrLocally(value);
+    setQrResult(parsed as QRResult);
+    setWebsitePreview(null);
+    if (parsed.review_warnings?.length) setLocalConflicts(items => [...new Set([...items, ...parsed.review_warnings!])]);
+    const next = { ...form };
+    const conflicts: string[] = [];
+    for (const key of ["company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
+      const proposed = parsed[key];
+      if (!proposed) continue;
+      if (form[key] && form[key] !== proposed) conflicts.push(`${key.replace(/_/g, " ")}: card says ${form[key]}; QR says ${proposed}`);
+      else next[key] = proposed;
     }
+    next.contact_numbers = stringValues([...form.contact_numbers, ...parsed.contact_numbers]);
+    next.email_addresses = stringValues([...form.email_addresses, ...parsed.email_addresses]);
+    next.raw_text = form.raw_text.includes(parsed.source_text) ? form.raw_text : [form.raw_text, parsed.source_text].filter(Boolean).join("\n");
+    if (conflicts.length) setLocalConflicts(items => [...new Set([...items, ...conflicts])]);
+    setForm(next);
+    setTab("form");
+    setNotice("QR data is ready. Review the values before saving.");
   }
 
   useEffect(() => {
@@ -719,7 +730,7 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
                 : batchDocuments[0];
               setDocument(fullDocument);
               setForm(formFromExtracted(fullDocument.extracted_fields || {}));
-              void enrichQrWebsite(fullDocument.extracted_fields || {});
+              presentQrChoices(fullDocument.extracted_fields.qr_payloads || []);
               setTab("form");
               setNotice(fullDocument.processing_status === "needs_review"
                 ? "OCR finished. Check the source and lead details, then choose Save lead."
@@ -830,6 +841,9 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
     setReviewBatchIds([]);
     setSourceDocumentIds([]);
     setBatchAsOneLead(asOneLead);
+    qrChoicesRef.current = [];
+    setQrChoices([]);
+    setQrResult(null);
     const rawFiles = files.filter((file) => /\.(txt|csv|xlsx)$/i.test(file.name));
     if (rawFiles.length) {
       setSearch("");
@@ -863,38 +877,14 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
         }
       }
       if (!documentFiles.length && !rawFiles.length) throw new Error("Choose card images, PDF, ZIP, TXT, CSV, or XLSX files.");
-        const imageFiles = documentFiles.filter((file) => /^(?:image\/(?:jpeg|png|webp|bmp))$/i.test(file.type) || /\.(jpe?g|png|webp|bmp)$/i.test(file.name));
+      const imageFiles = documentFiles.filter((file) => /^(?:image\/(?:jpeg|png|webp|bmp))$/i.test(file.type) || /\.(jpe?g|png|webp|bmp)$/i.test(file.name));
       const otherDocuments = documentFiles.filter((file) => !imageFiles.includes(file));
-      // QR uploads should never wait for OCR or a server round trip. Decode
-      // the image locally first, including on browsers without BarcodeDetector.
+      // Surface QR choices immediately, then keep reading the printed card.
+      // The dedicated QR-image action skips text OCR when that is intended.
       if (!rawFiles.length && imageFiles.length && otherDocuments.length === 0) {
         const qrPayloads = [...new Set((await Promise.all(imageFiles.map((file) => scanQrImage(file).catch(() => [])))).flat())];
         if (qrPayloads.length) {
-          const qrFields = qrPayloads.reduce<ExtractedLeadFields>((merged, payload) => {
-            const parsed = parseQrLocally(payload) as ExtractedLeadFields;
-            for (const key of ["company_name", "owner_name", "designation", "business_description", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
-              if (!merged[key] && parsed[key]) merged[key] = parsed[key];
-            }
-            merged.contact_numbers = stringValues([...(merged.contact_numbers || []), ...(parsed.contact_numbers || [])]);
-            merged.email_addresses = stringValues([...(merged.email_addresses || []), ...(parsed.email_addresses || [])]);
-            merged.raw_text = [merged.raw_text, parsed.raw_text].filter(Boolean).join("\n");
-            merged.qr_payloads = qrPayloads;
-            merged.field_sources = { ...(merged.field_sources || {}), ...(parsed.field_sources || {}) };
-            return merged;
-          }, { qr_payloads: qrPayloads });
-          const previewUrls = imageFiles.map((file) => URL.createObjectURL(file));
-          setLocalPreviewUrls(previewUrls);
-          setLocalPreviewUrl(previewUrls[0] || "");
-          setQrResult(parseQrLocally(qrPayloads[0]) as QRResult);
-          setForm(formFromExtracted(qrFields));
-          setLocalOriginalOcrText(qrFields.raw_text || "");
-          setTab("form");
-          setBusy(false);
-          scanSubmissionRef.current = false;
-          scanStartedAtRef.current = 0;
-          setScanStage("");
-          setNotice("QR code decoded on this device. Review the fields before saving.");
-          return;
+          presentQrChoices(qrPayloads);
         }
       }
       if (!forceServerOcr && !rawFiles.length && imageFiles.length > 0 && imageFiles.length <= 4 && otherDocuments.length === 0) {
@@ -1155,7 +1145,7 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
       setRawCandidates([]);
       setEditingLead(null);
       setForm(formFromExtracted(fullDocument.extracted_fields || {}));
-      void enrichQrWebsite(fullDocument.extracted_fields || {});
+      presentQrChoices(fullDocument.extracted_fields.qr_payloads || []);
       setReviewedFingerprint("");
       setTab("form");
     } catch (err) {
@@ -1415,7 +1405,7 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
             <p className="subheading">Scan business documents and keep your contacts in one place.</p></div>
           <div className="upload-actions">
             <button className="button button-secondary" type="button" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraError(""); setCameraOpen(true); }}>Open camera</button>
-            <button className="button button-secondary" type="button" onClick={() => { setQrResult(null); setWebsitePreview(null); setQrCameraError(""); setQrCameraOpen(true); }}>Scan QR</button>
+            <button className="button button-secondary" type="button" onClick={() => { qrChoicesRef.current = []; setQrChoices([]); setQrResult(null); setWebsitePreview(null); setQrCameraError(""); setQrCameraOpen(true); }}>Scan QR</button>
             <label className="button button-primary upload-button"><span aria-hidden="true">＋</span> Upload files
               <input type="file" multiple accept="image/*,.pdf,.zip,.txt,.csv,.xlsx" onChange={upload} />
             </label>
@@ -1514,7 +1504,9 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
           </section>
         )}
         {cameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="camera-title"><header><div><span className="eyebrow">LIVE SCANNER</span><h2 id="camera-title">Capture card images</h2><p>{cameraFiles.length ? `${cameraFiles.length} image${cameraFiles.length === 1 ? "" : "s"} captured. Capture the back side too, then scan.` : "Capture the front side, then optionally capture the back side."}</p><p className="camera-tip">For a sharper scan, use bright even light, hold the phone steady, and fit the whole card inside the frame.</p></div><button className="details-close" aria-label="Close camera" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraOpen(false); }}>×</button></header><div className="camera-preview"><video ref={videoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{cameraError && <p className="camera-error" role="alert">{cameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => { cameraPreparationMsRef.current = 0; setCameraFiles([]); setCameraOpen(false); }}>Cancel</button><button className="button button-secondary" onClick={() => void capturePhoto()}>Capture {cameraFiles.length ? "another" : "image"}</button><button className="button button-primary" onClick={() => void finishCameraScan()} disabled={!cameraFiles.length}>Scan {cameraFiles.length || ""} image{cameraFiles.length === 1 ? "" : "s"}</button></div></section></div>}
-        {qrCameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="qr-camera-title"><header><div><span className="eyebrow">QR SCANNER</span><h2 id="qr-camera-title">Scan a QR code</h2><p>Point the rear camera at a QR code. The code will be decoded locally and shown for review.</p></div><button className="details-close" aria-label="Close QR scanner" onClick={() => setQrCameraOpen(false)}>×</button></header><div className="camera-preview"><video ref={qrVideoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{qrCameraError && <p className="camera-error" role="alert">{qrCameraError}</p>}<div className="camera-actions"><button className="button button-secondary" onClick={() => setQrCameraOpen(false)}>Cancel</button></div></section></div>}
+        {qrCameraOpen && <div className="camera-backdrop" role="presentation"><section className="camera-dialog" role="dialog" aria-modal="true" aria-labelledby="qr-camera-title"><header><div><span className="eyebrow">QR SCANNER</span><h2 id="qr-camera-title">Scan a QR code</h2><p>Point the rear camera at a QR code. The code will be decoded locally and shown for review.</p></div><button className="details-close" aria-label="Close QR scanner" onClick={() => setQrCameraOpen(false)}>×</button></header><div className="camera-preview"><video ref={qrVideoRef} playsInline autoPlay muted /><div className="scanner-frame" /></div>{qrCameraError && <p className="camera-error" role="alert">{qrCameraError}</p>}<div className="camera-actions"><label className="button button-secondary">Choose QR image<input type="file" accept="image/*" style={{ display: "none" }} onChange={uploadQrImage} /></label><button className="button button-secondary" onClick={() => setQrCameraOpen(false)}>Cancel</button></div></section></div>}
+        {qrChoices.length > 1 && <section className="qr-result panel" aria-label="Choose QR code"><strong>Choose a QR code</strong>{qrChoices.map(payload => <button type="button" className="button button-secondary" style={{ whiteSpace: "normal", overflowWrap: "anywhere" }} key={payload} onClick={() => acceptQrPayload(payload)}>{parseQrLocally(payload).kind}: {payload}</button>)}</section>}
+        {qrResult && <section className="panel" aria-label="QR link details"><p>QR type: {safeText(qrResult.kind) || "text"}. Review the source before using it.</p>{["whatsapp_link", "instagram_link", "facebook_link", "map_url", "app_url", "qr_redirect_url"].map(key => { const value = safeText(qrResult[key]); return /^https?:\/\//i.test(value) ? <p key={key}><a href={value} target="_blank" rel="noreferrer">{key.replace(/_/g, " ")}: {value}</a></p> : null; })}{Boolean(qrResult.location_coordinates) && <p>Coordinates: {JSON.stringify(qrResult.location_coordinates)}. A street address has not been verified.</p>}{localConflicts.length > 0 && <ul>{localConflicts.map(item => <li key={item}>{item}</li>)}</ul>}</section>}
         {qrResult && <section className="qr-result panel" aria-label="QR result"><div><strong>QR data decoded</strong><p className="muted">{safeText(qrResult.source_text)}</p></div>{safeText(qrResult.website) && <div className="qr-result-actions"><a className="button button-secondary" href={safeText(qrResult.website)} target="_blank" rel="noreferrer">Open website</a><button className="button button-secondary" type="button" onClick={() => void previewQrWebsite()} disabled={busy}>Read public page</button></div>}{websitePreview && <details open><summary>Website preview</summary><p>{websitePreview.source_text || "No readable metadata was found."}</p>{websitePreview.warnings.map((warning) => <p className="camera-error" key={warning}>{warning}</p>)}</details>}</section>}
         {viewingLead && <div className="details-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setViewingLead(null); }}>
           <section className="details-dialog" role="dialog" aria-modal="true" aria-labelledby="details-title">
@@ -1576,4 +1568,3 @@ function App() {
 }
 
 export default App;
-

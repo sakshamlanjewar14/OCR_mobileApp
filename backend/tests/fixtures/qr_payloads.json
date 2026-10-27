@@ -1,0 +1,19 @@
+[
+  {"payload":"BEGIN:VCARD\r\nVERSION:3.0\r\nN:Person;Test;;;\r\nFN:Test Person\r\nORG:Example Systems Pvt Ltd\r\nTEL;TYPE=CELL:+919876543210\r\nTEL;TYPE=WORK:9876543210\r\nADR;TYPE=WORK:;;Unit 7\\; West Wing;Example City;Region;411001;India\r\nURL:https://example.org/path?a=1,2&b=3\r\nEND:VCARD","expected":{"kind":"vcard","owner_name":"Test Person","company_address":"Unit 7; West Wing, Example City, Region, 411001, India","contacts":["+919876543210"],"website":"https://example.org/path?a=1,2&b=3"}},
+  {"payload":"BEGIN:VCARD\nFN:Test \n Person\nEMAIL;TYPE=WORK:person@example.org\nEND:VCARD","expected":{"owner_name":"Test Person","emails":["person@example.org"]}},
+  {"payload":"MECARD:N:Person,Test;ORG:Example Systems;TEL:+919876543210;TEL:+919876543211;ADR:Unit 7\\; West Wing;URL:https://example.org;;","expected":{"kind":"mecard","owner_name":"Test Person","contacts":["+919876543210","+919876543211"],"company_address":"Unit 7; West Wing","website":"https://example.org"}},
+  {"payload":"https://wa.me/919876543210?text=Hi%20there","expected":{"kind":"whatsapp","contacts":["+919876543210"],"whatsapp_link":"https://wa.me/919876543210?text=Hi%20there"},"absent":["website"]},
+  {"payload":"https://api.whatsapp.com/send?phone=919876543210&text=Hi","expected":{"kind":"whatsapp","contacts":["+919876543210"]},"absent":["website"]},
+  {"payload":"https://chat.whatsapp.com/ABCDEFG12345","expected":{"kind":"whatsapp","contacts":[]},"absent":["website"]},
+  {"payload":"https://www.instagram.com/example/?utm_source=qr","expected":{"kind":"instagram","contacts":[],"instagram_link":"https://www.instagram.com/example/?utm_source=qr"},"absent":["website"]},
+  {"payload":"https://www.google.com/maps?q=19.076,72.8777","expected":{"kind":"location","location_coordinates":{"latitude":19.076,"longitude":72.8777},"contacts":[]},"absent":["website","company_address"]},
+  {"payload":"geo:91,72","expected":{"kind":"location"},"absent":["website","company_address","location_coordinates"]},
+  {"payload":"https://play.google.com/store/apps/details?id=org.example.demo","expected":{"kind":"app","app_url":"https://play.google.com/store/apps/details?id=org.example.demo"},"absent":["website"]},
+  {"payload":"https://apps.apple.com/app/id123456789","expected":{"kind":"app","contacts":[]},"absent":["website"]},
+  {"payload":"https://api.singleqr.in/r/example","expected":{"kind":"redirect","qr_redirect_url":"https://api.singleqr.in/r/example"},"absent":["website"]},
+  {"payload":"javascript:alert(123456789)","expected":{"contacts":[],"urls":[]},"absent":["website"]},
+  {"payload":"https://user:password@example.org/","expected":{"contacts":[],"urls":[]},"absent":["website"]},
+  {"payload":"tel:+९१९८७६५४३२१०","expected":{"kind":"phone","contacts":["+919876543210"]}},
+  {"payload":"mailto:person@example.org?subject=Hello","expected":{"kind":"email","emails":["person@example.org"]}},
+  {"payload":"Call +91 9876543210\nEmail person@example.org","expected":{"contacts":["+91 9876543210"],"emails":["person@example.org"]}}
+]
