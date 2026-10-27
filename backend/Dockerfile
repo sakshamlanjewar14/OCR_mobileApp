@@ -17,12 +17,20 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Use the lightweight official traineddata files so normal card scans use
-# less CPU and memory.  The language packages above remain as a safe fallback.
+# Prefer the lightweight official traineddata files when the build network
+# allows it, but never fail a deployment because GitHub is unavailable. The
+# language packages installed above are a working fallback.
 RUN tessdata_dir="$(tesseract --print-tessdata-dir)" \
     && for language in eng hin mar; do \
-         wget -q "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/${language}.traineddata" \
-           -O "${tessdata_dir}/${language}.traineddata"; \
+         temporary="${tessdata_dir}/${language}.traineddata.fast"; \
+         if wget -q --timeout=15 --tries=2 \
+           "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/${language}.traineddata" \
+           -O "${temporary}" && test -s "${temporary}"; then \
+           mv "${temporary}" "${tessdata_dir}/${language}.traineddata"; \
+         else \
+           rm -f "${temporary}"; \
+           echo "Using packaged ${language} traineddata"; \
+         fi; \
        done
 
 WORKDIR /app
