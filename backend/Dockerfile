@@ -13,25 +13,10 @@ RUN apt-get update \
         tesseract-ocr-eng \
         tesseract-ocr-hin \
         tesseract-ocr-mar \
-        ca-certificates \
-        wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Prefer the lightweight official traineddata files when the build network
-# allows it, but never fail a deployment because GitHub is unavailable. The
-# language packages installed above are a working fallback.
-RUN tessdata_dir="$(tesseract --print-tessdata-dir)" \
-    && for language in eng hin mar; do \
-         temporary="${tessdata_dir}/${language}.traineddata.fast"; \
-         if wget -q --timeout=15 --tries=2 \
-           "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/${language}.traineddata" \
-           -O "${temporary}" && test -s "${temporary}"; then \
-           mv "${temporary}" "${tessdata_dir}/${language}.traineddata"; \
-         else \
-           rm -f "${temporary}"; \
-           echo "Using packaged ${language} traineddata"; \
-         fi; \
-       done
+# The Debian language packages provide the traineddata files during the image
+# build. No runtime or external model download is required.
 
 WORKDIR /app
 COPY requirements.txt ./requirements.txt
