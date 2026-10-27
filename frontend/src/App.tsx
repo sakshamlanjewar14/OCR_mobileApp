@@ -64,7 +64,7 @@ type ExtractedLeadFields = Omit<Partial<Record<keyof LeadForm, string | null>>, 
   qr_payloads?: string[];
   qr_data?: Record<string, unknown>[];
   field_sources?: Record<string, { source_type: string; source_text: string; confidence: string }>;
-  processing_times_ms?: { ocr_ms?: number; translation_ms?: number; translation_model_init_ms?: number; translation_inference_ms?: number; field_extraction_ms?: number; decode_ms?: number; preprocess_ms?: number; qr_ms?: number; queue_ms?: number; total_ms?: number };
+  processing_times_ms?: { ocr_ms?: number; translation_ms?: number; translation_model_init_ms?: number; translation_inference_ms?: number; field_extraction_ms?: number; decode_ms?: number; preprocess_ms?: number; qr_ms?: number; queue_ms?: number; total_ms?: number; image_width?: number; image_height?: number; image_bytes?: number };
 };
 type DocumentRecord = {
   id: string;

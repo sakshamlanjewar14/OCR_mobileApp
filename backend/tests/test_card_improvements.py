@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -67,6 +68,16 @@ class CardImprovementsTests(unittest.TestCase):
         for key in ("company_name", "owner_name", "company_address"):
             self.assertIsNone(fields.get(key))
         self.assertTrue(fields["review_warnings"])
+
+    def test_processing_metadata_records_source_dimensions_and_size(self):
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as source:
+            source.write(b"image-bytes")
+            source.flush()
+            fields = {"processing_times_ms": {}}
+            ocr._set_image_metadata(fields, Image.new("RGB", (320, 180)), Path(source.name))
+        self.assertEqual(fields["processing_times_ms"]["image_width"], 320)
+        self.assertEqual(fields["processing_times_ms"]["image_height"], 180)
+        self.assertEqual(fields["processing_times_ms"]["image_bytes"], 11)
 
 
 if __name__ == "__main__": unittest.main()

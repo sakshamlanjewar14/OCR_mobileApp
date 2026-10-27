@@ -633,11 +633,13 @@ def _process_document_with_request_id(document_id: str, request_id: str, started
                 if isinstance(target, dict):
                     target.setdefault("processing_times_ms", {})["request_id"] = request_id
                     timings = target.get("processing_times_ms", {})
-                    logger.info("ocr_complete request_id=%s duration_ms=%.1f queue_ms=%s decode_ms=%s preprocess_ms=%s ocr_ms=%s translation_ms=%s field_extraction_ms=%s qr_ms=%s",
+                    logger.info("ocr_complete request_id=%s duration_ms=%.1f engine=%s model=%s queue_ms=%s decode_ms=%s preprocess_ms=%s ocr_ms=%s translation_ms=%s field_extraction_ms=%s qr_ms=%s image=%sx%s bytes=%s",
                                 request_id, (time.perf_counter() - started) * 1000,
+                                target.get("ocr_engine"), target.get("ocr_models", {}).get("recognition_model") if isinstance(target.get("ocr_models"), dict) else None,
                                 timings.get("queue_ms"), timings.get("decode_ms"), timings.get("preprocess_ms"),
                                 timings.get("ocr_ms"), timings.get("translation_ms"),
-                                timings.get("field_extraction_ms"), timings.get("qr_ms"))
+                                timings.get("field_extraction_ms"), timings.get("qr_ms"),
+                                timings.get("image_width"), timings.get("image_height"), timings.get("image_bytes"))
             document.extracted_fields = fields
             db.commit()
 

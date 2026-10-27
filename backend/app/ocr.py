@@ -1329,6 +1329,19 @@ def _set_processing_time(fields: dict[str, object], name: str, elapsed_ms: float
     fields["processing_times_ms"] = times
 
 
+def _set_image_metadata(fields: dict[str, object], image: Image.Image, path: Path) -> None:
+    """Attach bounded source metadata to the existing timing diagnostics."""
+    times = fields.get("processing_times_ms")
+    if not isinstance(times, dict):
+        times = {}
+    times.update({
+        "image_width": image.width,
+        "image_height": image.height,
+        "image_bytes": path.stat().st_size if path.exists() else 0,
+    })
+    fields["processing_times_ms"] = times
+
+
 def extract_fields(path: Path, content_type: str) -> dict[str, object]:
     started = time.perf_counter()
     if content_type == "application/pdf":
@@ -1358,6 +1371,7 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
             _set_processing_time(card, "decode_ms", decode_ms)
             _set_processing_time(card, "preprocess_ms", preprocessing_ms)
             _set_processing_time(card, "qr_ms", (time.perf_counter() - qr_started) * 1000)
+            _set_image_metadata(card, image, path)
             cards.append(card)
         cards = [card for card in cards if card.get("company_name") and (card.get("contact_numbers") or card.get("email_addresses") or card.get("website") or card.get("company_address"))]
         if len(cards) > 1:
@@ -1388,6 +1402,7 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
     _set_processing_time(fields, "decode_ms", decode_ms)
     _set_processing_time(fields, "preprocess_ms", preprocessing_ms)
     _set_processing_time(fields, "qr_ms", (time.perf_counter() - qr_started) * 1000)
+    _set_image_metadata(fields, image, path)
     return fields
 
 
