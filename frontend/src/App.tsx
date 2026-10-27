@@ -1,7 +1,7 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import "./details.css";
 import { clearLeadDraft, enqueueLead, readLeadDraft, readLeadQueue, removeQueuedLead, saveLeadDraft } from "./draftStore";
-import { decodeQrFromVideo, parseQrLocally, recognizeCard } from "./clientOcr";
+import { decodeQrFromVideo, parseQrLocally, recognizeCard, scanQrImage } from "./clientOcr";
 
 // Development uses the Vite same-origin proxy so cookie authentication is not
 // blocked by browser CORS. Production keeps the configured API origin.
@@ -867,6 +867,38 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
       if (!documentFiles.length && !rawFiles.length) throw new Error("Choose card images, PDF, ZIP, TXT, CSV, or XLSX files.");
         const imageFiles = documentFiles.filter((file) => /^(?:image\/(?:jpeg|png|webp|bmp))$/i.test(file.type) || /\.(jpe?g|png|webp|bmp)$/i.test(file.name));
       const otherDocuments = documentFiles.filter((file) => !imageFiles.includes(file));
+      // QR uploads should never wait for OCR or a server round trip. Decode
+      // the image locally first, including on browsers without BarcodeDetector.
+      if (!rawFiles.length && imageFiles.length && otherDocuments.length === 0) {
+        const qrPayloads = [...new Set((await Promise.all(imageFiles.map((file) => scanQrImage(file).catch(() => [])))).flat())];
+        if (qrPayloads.length) {
+          const qrFields = qrPayloads.reduce<ExtractedLeadFields>((merged, payload) => {
+            const parsed = parseQrLocally(payload) as ExtractedLeadFields;
+            for (const key of ["company_name", "owner_name", "designation", "business_description", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
+              if (!merged[key] && parsed[key]) merged[key] = parsed[key];
+            }
+            merged.contact_numbers = stringValues([...(merged.contact_numbers || []), ...(parsed.contact_numbers || [])]);
+            merged.email_addresses = stringValues([...(merged.email_addresses || []), ...(parsed.email_addresses || [])]);
+            merged.raw_text = [merged.raw_text, parsed.raw_text].filter(Boolean).join("\n");
+            merged.qr_payloads = qrPayloads;
+            merged.field_sources = { ...(merged.field_sources || {}), ...(parsed.field_sources || {}) };
+            return merged;
+          }, { qr_payloads: qrPayloads });
+          const previewUrls = imageFiles.map((file) => URL.createObjectURL(file));
+          setLocalPreviewUrls(previewUrls);
+          setLocalPreviewUrl(previewUrls[0] || "");
+          setQrResult(parseQrLocally(qrPayloads[0]) as QRResult);
+          setForm(formFromExtracted(qrFields));
+          setLocalOriginalOcrText(qrFields.raw_text || "");
+          setTab("form");
+          setBusy(false);
+          scanSubmissionRef.current = false;
+          scanStartedAtRef.current = 0;
+          setScanStage("");
+          setNotice("QR code decoded on this device. Review the fields before saving.");
+          return;
+        }
+      }
       if (!forceServerOcr && !rawFiles.length && imageFiles.length > 0 && imageFiles.length <= 4 && otherDocuments.length === 0) {
         try {
           setScanStage("Preparing card image for local OCR");

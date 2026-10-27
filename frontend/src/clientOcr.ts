@@ -145,6 +145,11 @@ async function detectQrPayloads(file: Blob): Promise<string[]> {
   }
 }
 
+/** Decode QR data from an uploaded image without starting OCR or uploading it. */
+export async function scanQrImage(file: Blob): Promise<string[]> {
+  return detectQrPayloads(file);
+}
+
 function decodeQrWithJsQr(source: CanvasImageSource): string[] {
   const width = source instanceof HTMLVideoElement ? source.videoWidth : source instanceof ImageBitmap ? source.width : (source as HTMLImageElement).naturalWidth || (source as HTMLCanvasElement).width;
   const height = source instanceof HTMLVideoElement ? source.videoHeight : source instanceof ImageBitmap ? source.height : (source as HTMLImageElement).naturalHeight || (source as HTMLCanvasElement).height;
