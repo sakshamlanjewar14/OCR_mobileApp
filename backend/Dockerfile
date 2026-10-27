@@ -13,7 +13,17 @@ RUN apt-get update \
         tesseract-ocr-eng \
         tesseract-ocr-hin \
         tesseract-ocr-mar \
+        ca-certificates \
+        wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Use the lightweight official traineddata files so normal card scans use
+# less CPU and memory.  The language packages above remain as a safe fallback.
+RUN tessdata_dir="$(tesseract --print-tessdata-dir)" \
+    && for language in eng hin mar; do \
+         wget -q "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/${language}.traineddata" \
+           -O "${tessdata_dir}/${language}.traineddata"; \
+       done
 
 WORKDIR /app
 COPY requirements.txt ./requirements.txt

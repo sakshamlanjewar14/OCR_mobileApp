@@ -93,14 +93,14 @@ class OCRLatencyRegressionTests(unittest.TestCase):
             _read_card_text(image)
         recovery.assert_not_called()
 
-    def test_found_name_and_phone_still_get_one_crop_for_missing_contact_details(self) -> None:
+    def test_found_name_and_phone_skips_recovery_for_missing_optional_details(self) -> None:
         image = Image.new("RGB", (900, 500), "white")
         with patch("backend.app.ocr._read_image_with_layout", return_value=(
             "Acme Industries Pvt Ltd\nJane Doe\n+91 9876543210", {}
         )), patch("backend.app.ocr._read_recovery_crops", return_value=["jane@acme.com\nwww.acme.com"]) as recovery:
             text, _ = _read_card_text(image)
-        recovery.assert_called_once_with(image, contact_details=True)
-        self.assertIn("jane@acme.com", text)
+        recovery.assert_not_called()
+        self.assertNotIn("jane@acme.com", text)
 
 
 class CombinedCardImageTests(unittest.TestCase):

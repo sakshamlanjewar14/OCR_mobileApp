@@ -40,6 +40,16 @@ class OCRUnavailableError(RuntimeError):
     """Raised when neither the configured OCR engine nor Windows OCR can run."""
 
 
+def _ocr_languages() -> str:
+    """Return the configured primary language set.
+
+    English is intentionally the fast default.  Indic OCR is selected only
+    for a card that needs it, instead of loading three language models for
+    every request.
+    """
+    return os.getenv("TESSERACT_LANGUAGES", "eng").strip() or "eng"
+
+
 def _tesseract_available() -> bool:
     command = str(pytesseract.pytesseract.tesseract_cmd)
     return Path(command).is_file() or shutil.which(command) is not None
@@ -113,7 +123,7 @@ def _windows_ocr(image: Image.Image) -> str:
 
 def _read_image(image: Image.Image) -> str:
     try:
-        return pytesseract.image_to_string(image, lang=os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar"))
+        return pytesseract.image_to_string(image, lang=_ocr_languages())
     except pytesseract.TesseractError:
         # Missing Hindi/Marathi traineddata should not make English card scanning fail.
         return pytesseract.image_to_string(image, lang="eng")
@@ -123,7 +133,7 @@ def _read_image(image: Image.Image) -> str:
         return _windows_ocr(image)
 
 
-def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
+def _read_image_with_layout(image: Image.Image, languages: str | None = None) -> tuple[str, dict[str, int]]:
     """Read OCR lines and their text heights so prominent brand text can be preferred."""
     # Windows OCR is the local fallback when Tesseract is not installed. It
     # cannot provide word boxes, so avoid calling it again for synthetic page
@@ -131,9 +141,11 @@ def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
     if _uses_windows_ocr_fallback():
         return _windows_ocr(image), {}
 
+    selected_languages = languages or _ocr_languages()
+
     def read(config: str = "") -> tuple[str, dict[str, int]]:
         try:
-            data = pytesseract.image_to_data(image, lang=os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar"), config=config, output_type=pytesseract.Output.DICT)
+            data = pytesseract.image_to_data(image, lang=selected_languages, config=config, output_type=pytesseract.Output.DICT)
         except pytesseract.TesseractError:
             data = pytesseract.image_to_data(image, lang="eng", config=config, output_type=pytesseract.Output.DICT)
         except pytesseract.TesseractNotFoundError:
@@ -154,28 +166,6 @@ def _read_image_with_layout(image: Image.Image) -> tuple[str, dict[str, int]]:
         return "\n".join(lines).strip(), heights
 
     text, heights = read()
-    # Stylized Hindi/Marathi cards often lose the prominent brand line in the
-    # default page segmentation. A contrast-enhanced sparse block pass is used
-    # only when no email or website was found.
-    if not re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:https?://|www\.)\S+", text, re.I):
-        enhanced = ImageEnhance.Contrast(ImageOps.grayscale(image)).enhance(1.8).convert("RGB")
-        previous = image
-        image = enhanced
-        alternate, alternate_heights = read("--psm 12")
-        image = previous
-        alternate_score = len(re.findall(r"[\u0900-\u097F]", alternate)) + 3 * len(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\+?\d[\d ()-]{7,}", alternate, re.I))
-        text_score = len(re.findall(r"[\u0900-\u097F]", text)) + 3 * len(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\+?\d[\d ()-]{7,}", text, re.I))
-        if alternate_score > text_score:
-            text = _merge_ocr_transcripts(text, alternate)
-            heights = {**heights, **alternate_heights}
-    # Reuse the sparse pass above when it already ran; a second identical
-    # Tesseract call added several seconds to cards without improving coverage.
-    if (re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:https?://|www\.)\S+", text, re.I)
-            and len(re.findall(r"[\u0900-\u097F]", text)) < 3):
-        indic_text, indic_heights = read("--psm 12")
-        if len(re.findall(r"[\u0900-\u097F]", indic_text)) >= 3:
-            text = _merge_ocr_transcripts(text, indic_text)
-            heights = {**heights, **indic_heights}
     return (text or _read_image(image)), heights
 
 
@@ -252,7 +242,7 @@ def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> l
             ((0, int(height * 0.25), int(width * 0.75), height), "--psm 6", 1.5),
         ]
     results: list[str] = []
-    crop_language = os.getenv("TESSERACT_LANGUAGES", "eng+hin+mar")
+    crop_language = _ocr_languages()
     for box, config, scale in boxes:
         crop = image.crop(box)
         if contact_details:
@@ -316,33 +306,31 @@ def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
             if score >= 3:
                 break
     fields = _parse_fields(text, heights)
+
+    # Keep the common English path to one OCR invocation.  Only cards that
+    # produced no useful English result get one Indic pass; this avoids the
+    # expensive eng+hin+mar run on every card while retaining Hindi/Marathi
+    # support.  Explicit TESSERACT_LANGUAGES values remain respected for
+    # deployments that intentionally choose a fixed language set.
+    if _ocr_languages() == "eng" and not any(
+        fields.get(key) for key in ("company_name", "owner_name", "contact_numbers", "email_addresses", "website")
+    ):
+        indic_text, indic_heights = _read_image_with_layout(image, languages="hin+mar")
+        if quality(indic_text) > quality(text):
+            text, heights = indic_text, indic_heights
+            fields = _parse_fields(text, heights)
+
     # Multiple clearly printed contacts are valid input even without a company.
     # Card-specific recovery crops would fragment a screenshot/contact list.
     if len(fields.get("contact_numbers") or []) >= 3:
         return text, heights
-    needs_recovery = (
-        not fields.get("company_name")
-        or not fields.get("owner_name")
-        or (not fields.get("contact_numbers") and not fields.get("email_addresses") and not fields.get("website"))
-        or (bool(fields.get("contact_numbers")) and not fields.get("email_addresses") and not fields.get("website"))
-        or any(re.search(r"[\u0900-\u097f]", str(fields.get(key) or "")) for key in ("company_name", "owner_name"))
-        or bool(re.search(r"\b(?:logis|technolog|corpor|industri)['’]?$", str(fields.get("company_name") or ""), re.I))
+    needs_recovery = not any(
+        fields.get(key) for key in ("company_name", "owner_name", "contact_numbers", "email_addresses", "website")
     )
     if needs_recovery:
-        contact_recovery = bool(fields.get("contact_numbers")) and not fields.get("email_addresses") and not fields.get("website")
-        focused_contact_pass = contact_recovery and not (
-            not fields.get("company_name") or not fields.get("owner_name")
-        )
-        for recovery in _read_recovery_crops(image, contact_details=focused_contact_pass):
+        for recovery in _read_recovery_crops(image):
             if recovery.strip():
                 text = _merge_ocr_transcripts(text, recovery)
-        recovered_fields = _parse_fields(text, heights)
-        if (not focused_contact_pass and (
-                (recovered_fields.get("contact_numbers") and not recovered_fields.get("email_addresses") and not recovered_fields.get("website"))
-                or (recovered_fields.get("email_addresses") and not recovered_fields.get("contact_numbers")))):
-            for recovery in _read_recovery_crops(image, contact_details=True):
-                if recovery.strip():
-                    text = _merge_ocr_transcripts(text, recovery)
     return text, heights
 
 
