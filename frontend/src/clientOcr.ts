@@ -1,3 +1,5 @@
+import jsQR from "jsqr";
+
 export type ClientExtractedFields = {
   company_name?: string | null;
   owner_name?: string | null;
@@ -79,6 +81,26 @@ function parseText(text: string): ClientExtractedFields {
 }
 
 export async function recognizeCard(file: Blob, onProgress?: (message: string) => void): Promise<ClientExtractedFields> {
+  // Decode QR before starting the heavier OCR worker. This makes QR-only
+  // uploads immediate and still lets normal cards continue through OCR.
+  const qrPayloads = await detectQrPayloads(file).catch(() => []);
+  let qrFields: ClientExtractedFields | null = null;
+  for (const payload of qrPayloads) {
+    const qr = parseQrLocally(payload);
+    qrFields = qrFields || { raw_text: "", original_ocr_text: "", field_sources: {} };
+    for (const key of ["company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
+      if (qr[key] && !qrFields[key]) qrFields[key] = qr[key] as string;
+    }
+    qrFields.contact_numbers = [...new Set([...(qrFields.contact_numbers || []), ...(qr.contact_numbers || [])])];
+    qrFields.email_addresses = [...new Set([...(qrFields.email_addresses || []), ...(qr.email_addresses || [])])];
+    qrFields.raw_text = [qrFields.raw_text, qr.source_text].filter(Boolean).join("\n");
+    qrFields.field_sources = { ...(qrFields.field_sources || {}), ...(qr.field_sources || {}) };
+  }
+  if (qrFields && (qrFields.company_name || qrFields.owner_name || qrFields.website || qrFields.contact_numbers?.length || qrFields.email_addresses?.length)) {
+    qrFields.qr_payloads = qrPayloads;
+    onProgress?.("QR code decoded");
+    return qrFields;
+  }
   const worker = await getWorker("eng", onProgress);
   if (!worker) throw new Error("Browser OCR worker is unavailable.");
   const result = await withTimeout(worker.recognize(file, { logger: (message) => onProgress?.(`${message.status || "Reading card"}${typeof message.progress === "number" ? ` ${Math.round(message.progress * 100)}%` : ""}`) }), 45_000, "Browser OCR timed out. Retry locally or choose server OCR.");
@@ -92,7 +114,6 @@ export async function recognizeCard(file: Blob, onProgress?: (message: string) =
       if (multilingualFields.raw_text.length > fields.raw_text.length || multilingualFields.contact_numbers?.length || multilingualFields.email_addresses?.length) fields = multilingualFields;
     }
   }
-  const qrPayloads = await detectQrPayloads(file).catch(() => []);
   for (const payload of qrPayloads) {
     const qr = parseQrLocally(payload);
     for (const key of ["company_name", "owner_name", "designation", "company_address", "website", "facebook_link", "instagram_link", "whatsapp_link"] as const) {
@@ -109,15 +130,53 @@ export async function recognizeCard(file: Blob, onProgress?: (message: string) =
 /** Warm the fast English model while the user is on the leads screen. */
 async function detectQrPayloads(file: Blob): Promise<string[]> {
   const BarcodeDetectorCtor = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: ImageBitmap) => Promise<Array<{ rawValue?: string }>> } }).BarcodeDetector;
-  if (!BarcodeDetectorCtor || typeof createImageBitmap !== "function") return [];
+  if (typeof createImageBitmap !== "function") return [];
   const bitmap = await createImageBitmap(file);
   try {
-    const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
-    const results = await withTimeout(detector.detect(bitmap), 2_000, "QR detection timed out");
-    return [...new Set(results.map((item) => item.rawValue?.trim()).filter((item): item is string => Boolean(item)))];
+    if (BarcodeDetectorCtor) {
+      const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
+      const results = await withTimeout(detector.detect(bitmap), 2_000, "QR detection timed out");
+      const nativeValues = [...new Set(results.map((item) => item.rawValue?.trim()).filter((item): item is string => Boolean(item)))];
+      if (nativeValues.length) return nativeValues;
+    }
+    return decodeQrWithJsQr(bitmap);
   } finally {
     bitmap.close();
   }
+}
+
+function decodeQrWithJsQr(source: CanvasImageSource): string[] {
+  const width = source instanceof HTMLVideoElement ? source.videoWidth : source instanceof ImageBitmap ? source.width : (source as HTMLImageElement).naturalWidth || (source as HTMLCanvasElement).width;
+  const height = source instanceof HTMLVideoElement ? source.videoHeight : source instanceof ImageBitmap ? source.height : (source as HTMLImageElement).naturalHeight || (source as HTMLCanvasElement).height;
+  if (!width || !height) return [];
+  const scale = Math.min(1, 1600 / Math.max(width, height));
+  const canvas = window.document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return [];
+  const values = new Set<string>();
+  const rotations = [0, 90, 180, 270];
+  for (const rotation of rotations) {
+    canvas.width = rotation % 180 ? Math.max(1, Math.round(height * scale)) : Math.max(1, Math.round(width * scale));
+    canvas.height = rotation % 180 ? Math.max(1, Math.round(width * scale)) : Math.max(1, Math.round(height * scale));
+    context.save();
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.translate(canvas.width / 2, canvas.height / 2);
+    context.rotate(rotation * Math.PI / 180);
+    context.drawImage(source, -width * scale / 2, -height * scale / 2, width * scale, height * scale);
+    context.restore();
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    const decoded = jsQR(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" });
+    if (decoded?.data.trim()) values.add(decoded.data.trim());
+  }
+  canvas.width = 1;
+  canvas.height = 1;
+  return [...values];
+}
+
+export function decodeQrFromVideo(video: HTMLVideoElement): string[] {
+  return decodeQrWithJsQr(video);
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

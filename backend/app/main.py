@@ -1485,11 +1485,10 @@ def export_leads(
         .group_by(contact_counts.c.contact_type)
     ).all()
     maximum_by_type = {contact_type: count for contact_type, count in maximums}
-    phone_column_count = max(1, maximum_by_type.get("phone", 0))
     email_column_count = max(1, maximum_by_type.get("email", 0))
     headers = [
         *EXPORT_LEAD_HEADERS,
-        *(f"Contact Number {index}" for index in range(1, phone_column_count + 1)),
+        "Contact Numbers",
         *(f"Email ID {index}" for index in range(1, email_column_count + 1)),
         *EXPORT_END_HEADERS,
     ]
@@ -1559,7 +1558,7 @@ def export_leads(
             contact_numbers, email_addresses = contacts_by_lead[row.id]
             values = [
                 row_count + row_offset + 1, row.lead_number, row.company_name, row.owner_name, row.designation, row.company_address, row.verification_status,
-                *contact_numbers, *([None] * (phone_column_count - len(contact_numbers))),
+                "\n".join(contact_numbers),
                 *email_addresses, *([None] * (email_column_count - len(email_addresses))),
                 row.website, row.facebook_link, row.instagram_link, row.whatsapp_link, row.business_description, row.raw_text,
             ]

@@ -1,7 +1,7 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import "./details.css";
 import { clearLeadDraft, enqueueLead, readLeadDraft, readLeadQueue, removeQueuedLead, saveLeadDraft } from "./draftStore";
-import { parseQrLocally, recognizeCard } from "./clientOcr";
+import { decodeQrFromVideo, parseQrLocally, recognizeCard } from "./clientOcr";
 
 // Development uses the Vite same-origin proxy so cookie authentication is not
 // blocked by browser CORS. Production keeps the configured API origin.
@@ -566,11 +566,11 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
     let cancelled = false;
     setQrCameraError("");
     const BarcodeDetectorCtor = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue?: string }>> } }).BarcodeDetector;
-    if (!navigator.mediaDevices?.getUserMedia || !BarcodeDetectorCtor) {
-      setQrCameraError("This browser cannot scan QR codes directly. Use the card image upload option instead.");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setQrCameraError("Camera access is unavailable. Allow camera permission or upload the QR image instead.");
       return;
     }
-    const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
+    const detector = BarcodeDetectorCtor ? new BarcodeDetectorCtor({ formats: ["qr_code"] }) : null;
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
       .then((stream) => {
         if (cancelled) { stream.getTracks().forEach((track) => track.stop()); return; }
@@ -579,8 +579,8 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
         const scan = async () => {
           if (cancelled || !qrVideoRef.current?.videoWidth) return;
           try {
-            const detected = await detector.detect(qrVideoRef.current);
-            const value = detected.find((item) => item.rawValue?.trim())?.rawValue?.trim();
+            const detected = detector ? await detector.detect(qrVideoRef.current) : [];
+            const value = detected.find((item) => item.rawValue?.trim())?.rawValue?.trim() || decodeQrFromVideo(qrVideoRef.current)[0];
             if (value) {
               setQrCameraOpen(false);
               const parsed = parseQrLocally(value) as QRResult;
@@ -1329,16 +1329,33 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
         if (stateFilter.trim()) params.set("state", stateFilter.trim());
       }
       if (exportCount.trim()) params.set("export_count", String(Number(exportCount)));
-      const response = await fetch(`${API}/exports/leads?${params.toString()}`);
-      if (!response.ok) throw new Error("Could not create spreadsheet.");
+      const response = await fetch(`${API}/exports/leads?${params.toString()}`, {
+        credentials: "include",
+        headers: { "X-Request-ID": crypto.randomUUID?.() || `export-${Date.now()}` },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || `Could not create spreadsheet (${response.status}).`);
+      }
       const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const anchor = window.document.createElement("a");
-      anchor.href = url;
-      anchor.download = "leads.xlsx";
-      anchor.click();
-      URL.revokeObjectURL(url);
-      setNotice("Spreadsheet downloaded. You can now share the file.");
+      const file = new File([blob], "leads.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      // Android/iOS browsers may ignore a synthetic download click. Prefer
+      // the native share sheet when it can accept the generated workbook.
+      if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
+        await navigator.share({ files: [file], title: "Lead Gennie export" });
+        setNotice("Spreadsheet ready. Choose an app to save or share it.");
+      } else {
+        const url = URL.createObjectURL(blob);
+        const anchor = window.document.createElement("a");
+        anchor.href = url;
+        anchor.download = "leads.xlsx";
+        anchor.rel = "noopener";
+        window.document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setNotice("Spreadsheet downloaded. You can now share the file.");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Export failed.");
     }
