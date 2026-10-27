@@ -405,7 +405,13 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     });
     headers.set("X-Request-ID", requestId);
   }
-  const response = await fetch(`${API}${path}`, { ...init, headers, credentials: "include" });
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, { ...init, headers, credentials: "include" });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "network error";
+    throw new Error(`Cannot reach the API at ${API}. Check the deployment or connection (${reason}).`);
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${response.status})`);
@@ -470,6 +476,9 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const scanPreparationMsRef = useRef(0);
   const scanUploadMsRef = useRef(0);
   const cameraPreparationMsRef = useRef(0);
+  const statusPollingPausedRef = useRef(false);
+  const statusFailureStartedRef = useRef(0);
+  const statusRetryCountRef = useRef(0);
 
   const loadLeads = useCallback(async (requestedPage = leadPage) => {
     try {
@@ -664,10 +673,12 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   }
 
   useEffect(() => {
+    if (statusPollingPausedRef.current) return;
     if (!pendingDocuments.some((item) => ["uploaded", "processing"].includes(item.processing_status))) return;
     setScanStage(pendingDocuments.some((item) => item.processing_status === "processing")
       ? "Reading card and extracting details"
       : "Waiting for the scanner");
+    const retryDelay = statusRetryCountRef.current ? Math.min(8000, 2000 * (2 ** Math.min(statusRetryCountRef.current - 1, 2))) : 2000;
     const timer = window.setTimeout(async () => {
       try {
         const statuses = await api<DocumentStatus[]>("/documents/status", {
@@ -676,6 +687,8 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
           body: JSON.stringify({ ids: pendingDocuments.map((item) => item.id) }),
         });
         const statusById = new Map(statuses.map((item) => [item.id, item]));
+        statusRetryCountRef.current = 0;
+        statusFailureStartedRef.current = 0;
         const updated = pendingDocuments.map((item) => ({ ...item, ...(statusById.get(item.id) || {
           processing_status: "failed", error_message: "Document status was not returned. Retry the scan.",
         }) }));
@@ -720,10 +733,20 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
           await loadScanIssues();
         }
       } catch (err) {
-        setError(err instanceof Error ? `${err.message}. Status checks will retry automatically.` : "Could not check document status. Status checks will retry automatically.");
-        setPendingDocuments((current) => [...current]);
+        statusRetryCountRef.current += 1;
+        if (!statusFailureStartedRef.current) statusFailureStartedRef.current = performance.now();
+        const timedOut = performance.now() - statusFailureStartedRef.current > 120000;
+        if (timedOut) {
+          statusPollingPausedRef.current = true;
+          setBusy(false);
+          setScanStage("OCR status is unavailable");
+          setError("The OCR server could not be reached for two minutes. Your uploaded source is still available; retry when the server is ready.");
+        } else {
+          setError(err instanceof Error ? `${err.message}. Retrying shortly.` : "Could not check document status. Retrying shortly.");
+          setPendingDocuments((current) => [...current]);
+        }
       }
-    }, 500);
+    }, retryDelay);
     return () => window.clearTimeout(timer);
   }, [pendingDocuments, loadScanIssues, rawCandidates.length, document, reviewBatchIds, batchAsOneLead]);
 
@@ -794,6 +817,9 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
     setError("");
     setNotice("");
     setBusy(true);
+    statusPollingPausedRef.current = false;
+    statusFailureStartedRef.current = 0;
+    statusRetryCountRef.current = 0;
     setEditingLead(null);
     setReviewedFingerprint("");
     setForm(emptyForm);

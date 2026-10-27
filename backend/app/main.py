@@ -733,14 +733,22 @@ def health() -> dict[str, str]:
 @app.get("/api/ready")
 def readiness() -> dict[str, str]:
     """Readiness for routing scans; /health remains a cheap process liveness check."""
+    database_ready = False
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
+        database_ready = True
+    except Exception:
+        logger.warning("readiness_failed component=database")
+    try:
         from .ocr import _tesseract_available, _uses_windows_ocr_fallback
-        if not _tesseract_available() and not _uses_windows_ocr_fallback():
-            raise RuntimeError("OCR engine unavailable")
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Backend dependencies are not ready.") from exc
+        ocr_ready = _tesseract_available() or _uses_windows_ocr_fallback()
+    except Exception:
+        ocr_ready = False
+    if not ocr_ready:
+        logger.warning("readiness_failed component=ocr")
+    if not database_ready or not ocr_ready:
+        raise HTTPException(status_code=503, detail="Backend dependencies are not ready.")
     return {"status": "ready"}
 
 

@@ -15,6 +15,11 @@ RUN apt-get update \
         tesseract-ocr-mar \
     && rm -rf /var/lib/apt/lists/*
 
+# Fail the image build early if the OCR executable or the required fast
+# English model is missing; otherwise scans would fail only after deployment.
+RUN tesseract --version >/dev/null \
+    && tesseract --list-langs | grep -qx eng
+
 # The Debian language packages provide the traineddata files during the image
 # build. No runtime or external model download is required.
 
