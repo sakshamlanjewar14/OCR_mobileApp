@@ -134,10 +134,12 @@ async function detectQrPayloads(file: Blob): Promise<string[]> {
   const bitmap = await createImageBitmap(file);
   try {
     if (BarcodeDetectorCtor) {
+      try {
       const detector = new BarcodeDetectorCtor({ formats: ["qr_code"] });
       const results = await withTimeout(detector.detect(bitmap), 2_000, "QR detection timed out");
       const nativeValues = [...new Set(results.map((item) => item.rawValue?.trim()).filter((item): item is string => Boolean(item)))];
       if (nativeValues.length) return nativeValues;
+      } catch { /* Unsupported native formats must not disable local decoding. */ }
     }
     return decodeQrWithJsQr(bitmap);
   } finally {
@@ -161,7 +163,7 @@ function decodeQrWithJsQr(source: CanvasImageSource): string[] {
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) return [];
   const values = new Set<string>();
-  const rotations = [0, 90, 180, 270];
+  const rotations = [0]; // jsQR handles rotated QR symbols internally.
   for (const rotation of rotations) {
     canvas.width = rotation % 180 ? Math.max(1, Math.round(height * scale)) : Math.max(1, Math.round(width * scale));
     canvas.height = rotation % 180 ? Math.max(1, Math.round(width * scale)) : Math.max(1, Math.round(height * scale));
@@ -174,6 +176,19 @@ function decodeQrWithJsQr(source: CanvasImageSource): string[] {
     const image = context.getImageData(0, 0, canvas.width, canvas.height);
     const decoded = jsQR(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" });
     if (decoded?.data.trim()) values.add(decoded.data.trim());
+    // Several codes in a frame can confuse the single-code locator. Scan
+    // overlapping regions at useful resolution without enlarging the frame.
+    if (!values.size) {
+      const tileWidth = Math.ceil(canvas.width * 0.65);
+      const tileHeight = Math.ceil(canvas.height * 0.5);
+      for (const y of [0, Math.floor((canvas.height - tileHeight) / 2), canvas.height - tileHeight]) {
+        for (const x of [0, canvas.width - tileWidth]) {
+          const tile = context.getImageData(x, y, tileWidth, tileHeight);
+          const found = jsQR(tile.data, tile.width, tile.height, { inversionAttempts: "attemptBoth" });
+          if (found?.data.trim()) values.add(found.data.trim());
+        }
+      }
+    }
   }
   canvas.width = 1;
   canvas.height = 1;

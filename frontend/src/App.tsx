@@ -2,6 +2,7 @@ import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from
 import "./details.css";
 import { clearLeadDraft, enqueueLead, readLeadDraft, readLeadQueue, removeQueuedLead, saveLeadDraft } from "./draftStore";
 import { decodeQrFromVideo, parseQrLocally, recognizeCard, scanQrImage } from "./clientOcr";
+import { startQrScanLoop } from "./qrScanner";
 
 // Development uses the Vite same-origin proxy so cookie authentication is not
 // blocked by browser CORS. Production keeps the configured API origin.
@@ -470,7 +471,6 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const qrVideoRef = useRef<HTMLVideoElement>(null);
   const qrStreamRef = useRef<MediaStream | null>(null);
-  const qrScanTimerRef = useRef<number | null>(null);
   const scanSubmissionRef = useRef(false);
   const scanStartedAtRef = useRef(0);
   const scanPreparationMsRef = useRef(0);
@@ -564,24 +564,26 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   useEffect(() => {
     if (!qrCameraOpen) return;
     let cancelled = false;
+    let stopScanning: (() => void) | undefined;
     setQrCameraError("");
     const BarcodeDetectorCtor = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue?: string }>> } }).BarcodeDetector;
     if (!navigator.mediaDevices?.getUserMedia) {
       setQrCameraError("Camera access is unavailable. Allow camera permission or upload the QR image instead.");
       return;
     }
-    const detector = BarcodeDetectorCtor ? new BarcodeDetectorCtor({ formats: ["qr_code"] }) : null;
+    let detector: InstanceType<NonNullable<typeof BarcodeDetectorCtor>> | null = null;
+    try { if (BarcodeDetectorCtor) detector = new BarcodeDetectorCtor({ formats: ["qr_code"] }); } catch { /* Local decoder remains available. */ }
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
       .then((stream) => {
         if (cancelled) { stream.getTracks().forEach((track) => track.stop()); return; }
         qrStreamRef.current = stream;
         if (qrVideoRef.current) { qrVideoRef.current.srcObject = stream; void qrVideoRef.current.play(); }
-        const scan = async () => {
-          if (cancelled || !qrVideoRef.current?.videoWidth) return;
-          try {
-            const detected = detector ? await detector.detect(qrVideoRef.current) : [];
-            const value = detected.find((item) => item.rawValue?.trim())?.rawValue?.trim() || decodeQrFromVideo(qrVideoRef.current)[0];
-            if (value) {
+        stopScanning = startQrScanLoop({
+          ready: () => Boolean(!cancelled && qrVideoRef.current && qrVideoRef.current.readyState >= 2 && qrVideoRef.current.videoWidth),
+          nativeScan: detector ? async () => (await detector!.detect(qrVideoRef.current!)).find((item) => item.rawValue?.trim())?.rawValue : undefined,
+          fallbackScan: () => decodeQrFromVideo(qrVideoRef.current!)[0],
+          onResult: (value) => {
+              stream.getTracks().forEach((track) => track.stop());
               setQrCameraOpen(false);
               const parsed = parseQrLocally(value) as QRResult;
               setQrResult(parsed);
@@ -596,23 +598,19 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
                 facebook_link: current.facebook_link || safeText(parsed.facebook_link),
                 instagram_link: current.instagram_link || safeText(parsed.instagram_link),
                 whatsapp_link: current.whatsapp_link || safeText(parsed.whatsapp_link),
-                contact_numbers: current.contact_numbers.length ? current.contact_numbers : (parsed.contacts || []),
-                email_addresses: current.email_addresses.length ? current.email_addresses : (parsed.emails || []),
+                contact_numbers: stringValues([...current.contact_numbers, ...((parsed.contact_numbers || parsed.contacts || []) as string[])]),
+                email_addresses: stringValues([...current.email_addresses, ...((parsed.email_addresses || parsed.emails || []) as string[])]),
                 raw_text: current.raw_text || safeText(parsed.source_text),
               }));
               setTab("form");
               setNotice("QR code decoded. Review the extracted fields before saving.");
-              return;
-            }
-          } catch { /* Camera frames can be unavailable while autofocus settles. */ }
-          qrScanTimerRef.current = window.setTimeout(() => void scan(), 180);
-        };
-        void scan();
+          },
+        });
       })
       .catch(() => setQrCameraError("Camera access is unavailable. Allow camera permission or upload the QR/card image."));
     return () => {
       cancelled = true;
-      if (qrScanTimerRef.current) window.clearTimeout(qrScanTimerRef.current);
+      stopScanning?.();
       qrStreamRef.current?.getTracks().forEach((track) => track.stop());
       qrStreamRef.current = null;
     };

@@ -1,6 +1,6 @@
 // Bump this whenever the production shell/API wiring changes so installed
 // PWAs do not keep running an older JavaScript bundle after deployment.
-const CACHE = "lead-gennie-shell-v3";
+const CACHE = "lead-gennie-shell-v4";
 const SHELL = ["/", "/manifest.webmanifest", "/icons/icon-192.svg", "/icons/icon-512.svg"];
 
 self.addEventListener("install", (event) => {
