@@ -135,12 +135,13 @@ def _read_image(image: Image.Image) -> str:
         except Exception:
             # Keep the existing Tesseract path as a safe engine fallback.
             pass
+    tess_image = ImageOps.grayscale(image) if image.mode != "L" else image
     try:
         _last_engine.set("tesseract")
-        return pytesseract.image_to_string(image, lang=_ocr_languages())
+        return pytesseract.image_to_string(tess_image, lang=_ocr_languages())
     except pytesseract.TesseractError:
         # Missing Hindi/Marathi traineddata should not make English card scanning fail.
-        return pytesseract.image_to_string(image, lang="eng")
+        return pytesseract.image_to_string(tess_image, lang="eng")
     except pytesseract.TesseractNotFoundError:
         if os.name != "nt":
             raise
@@ -171,10 +172,11 @@ def _read_image_with_layout(image: Image.Image, languages: str | None = None) ->
     _last_engine.set("tesseract")
 
     def read(config: str = "") -> tuple[str, dict[str, int]]:
+        tess_image = ImageOps.grayscale(image) if image.mode != "L" else image
         try:
-            data = pytesseract.image_to_data(image, lang=selected_languages, config=config, output_type=pytesseract.Output.DICT)
+            data = pytesseract.image_to_data(tess_image, lang=selected_languages, config=config, output_type=pytesseract.Output.DICT)
         except pytesseract.TesseractError:
-            data = pytesseract.image_to_data(image, lang="eng", config=config, output_type=pytesseract.Output.DICT)
+            data = pytesseract.image_to_data(tess_image, lang="eng", config=config, output_type=pytesseract.Output.DICT)
         except pytesseract.TesseractNotFoundError:
             if os.name != "nt":
                 raise
@@ -272,8 +274,7 @@ def _read_recovery_crops(image: Image.Image, contact_details: bool = False) -> l
     crop_language = _ocr_languages()
     for box, config, scale in boxes:
         crop = image.crop(box)
-        if contact_details:
-            crop = ImageOps.grayscale(crop)
+        crop = ImageOps.grayscale(crop) if crop.mode != "L" else crop
         if scale > 1:
             crop = crop.resize((round(crop.width * scale), round(crop.height * scale)), Image.Resampling.LANCZOS)
         if _uses_windows_ocr_fallback():
@@ -330,7 +331,7 @@ def _read_card_text(image: Image.Image) -> tuple[str, dict[str, int]]:
             if score > best_score:
                 image, text, heights = candidate, candidate_text, candidate_heights
                 best_score = score
-            if score >= 3:
+            if score >= 1:
                 break
     fields = _parse_fields(text, heights)
 
@@ -1189,33 +1190,37 @@ def _decode_qr_payloads(image: Image.Image) -> list[str]:
     if cv2 is None or np is None:
         return []
     rgb = image.convert("RGB")
-    rgb.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
+    rgb.thumbnail((1600, 1600), Image.Resampling.BILINEAR)
     pixels = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
     detector = cv2.QRCodeDetector()
-    decoded = []
+    decoded: list[str] = []
 
-    def scan(candidate):
+    def scan(candidate) -> bool:
         try:
             ok, values, _, _ = detector.detectAndDecodeMulti(candidate)
-            if ok and values is not None:
-                decoded.extend(value.strip() for value in values if value and value.strip())
-            else:
-                value, _, _ = detector.detectAndDecode(candidate)
-                if value and value.strip(): decoded.append(value.strip())
+            if ok and values is not None and any(v and v.strip() for v in values):
+                decoded.extend(v.strip() for v in values if v and v.strip())
+                return True
+            value, _, _ = detector.detectAndDecode(candidate)
+            if value and value.strip():
+                decoded.append(value.strip())
+                return True
         except (cv2.error, ValueError, TypeError):
             pass
+        return False
 
     scan(pixels)
     if not decoded and max(pixels.shape[:2]) < 1000:
         scan(cv2.resize(pixels, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
-    # A successful frame can still contain additional codes. Eight overlapping
-    # crops recover small codes without upscaling the entire photo fourfold.
-    h, w = pixels.shape[:2]
-    tw, th = max(1, round(w * .55)), max(1, round(h * .3))
-    for y in (round((h - th) * row / 3) for row in range(4)):
-        for x in (0, w - tw):
-            crop = pixels[y:y + th, x:x + tw]
-            scan(crop)
+    # If full-frame or 2x upscale decoded multiple codes, no need for crops.
+    # Otherwise check crops to recover small or multi-code cards (like salon card).
+    if len(decoded) < 2:
+        h, w = pixels.shape[:2]
+        tw, th = max(1, round(w * .55)), max(1, round(h * .3))
+        for y in (round((h - th) * row / 3) for row in range(4)):
+            for x in (0, w - tw):
+                crop = pixels[y:y + th, x:x + tw]
+                scan(crop)
     return list(dict.fromkeys(decoded))
 
 def _merge_qr_fields(fields: dict[str, object], payloads: list[str]) -> dict[str, object]:
@@ -1382,11 +1387,11 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
     # Aspect ratio is not text orientation: screenshots and documents are often tall.
     ocr_image = image
     longest_side = max(ocr_image.size)
-    if longest_side > 2200:
-        scale = 2200 / longest_side
+    if longest_side > 1600:
+        scale = 1600 / longest_side
         ocr_image = ocr_image.resize(
             (max(1, round(ocr_image.width * scale)), max(1, round(ocr_image.height * scale))),
-            Image.Resampling.LANCZOS,
+            Image.Resampling.BILINEAR,
         )
     preprocessing_ms = (time.perf_counter() - preprocessing_started) * 1000
     ocr_started = time.perf_counter()
@@ -1394,9 +1399,7 @@ def extract_fields(path: Path, content_type: str) -> dict[str, object]:
     ocr_ms = (time.perf_counter() - ocr_started) * 1000
     extracted_fields = _fields_from_ocr_text(text, line_heights)
     qr_started = time.perf_counter()
-    qr_payloads = _decode_qr_payloads(image)
-    if ocr_image is not image:
-        qr_payloads += _decode_qr_payloads(ocr_image)
+    qr_payloads = _decode_qr_payloads(ocr_image if ocr_image is not image else image)
     fields = _merge_qr_fields(extracted_fields, qr_payloads)
     fields = _record_processing_times(fields, started, ocr_ms)
     _set_processing_time(fields, "decode_ms", decode_ms)

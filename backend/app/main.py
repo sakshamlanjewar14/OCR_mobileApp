@@ -31,12 +31,12 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.utils import get_column_letter
-from sqlalchemy import func, inspect, or_, select, text, update, delete
+from sqlalchemy import and_, func, inspect, or_, select, text, update, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from PIL import Image, UnidentifiedImageError
 try:
-    import bcrypt
+    import bcrypt  
 except ImportError:  # Local minimal environments can still run the auth flow.
     bcrypt = None
 
@@ -51,9 +51,10 @@ from .ocr import OCRUnavailableError, _parse_fields, extract_fields
 from . import paddle_ocr
 from .qr import parse_qr_payload
 from .geocoding import reverse_geocode
-from .schemas import (DocumentRead, DocumentStatusRead, DocumentStatusRequest, ForgotPasswordRequest, LeadCreate,
-                      LeadFields, LeadRead, LeadUpdate, LoginRequest, QRParseRequest, RegisterRequest,
-                      QRWebsitePreviewRequest, ResetPasswordRequest, ReverseGeocodeRequest, UserRead)
+from .schemas import (DocumentRead, DocumentStatusRead, DocumentStatusRequest, DuplicateCheckRequest,
+                      DuplicateCheckResponse, ForgotPasswordRequest, LeadCreate, LeadFields, LeadRead, LeadUpdate,
+                      LoginRequest, QRParseRequest, RegisterRequest, QRWebsitePreviewRequest,
+                      ResetPasswordRequest, ReverseGeocodeRequest, UserRead)
 from .translation import warm_translation_model
 
 
@@ -701,6 +702,56 @@ def _lead_read(lead: Lead) -> LeadRead:
     return result
 
 
+def _find_duplicate_lead(
+    db: Session,
+    user: User | None,
+    contact_numbers: list[str] | None,
+    email_addresses: list[str] | None,
+    exclude_lead_id: str | None = None,
+) -> tuple[Lead, str, str] | None:
+    """Check if any phone number or email address matches an existing lead.
+    Returns (matched_lead, matched_type, matched_value) or None if no duplicate.
+    """
+    cleaned_emails = [e.strip().casefold() for e in (email_addresses or []) if e and e.strip()]
+    phone_digits_list = [re.sub(r"\D", "", p) for p in (contact_numbers or []) if p and p.strip()]
+    phone_10_digits = {p[-10:] for p in phone_digits_list if len(p) >= 10}
+    other_phones = {p for p in phone_digits_list if 0 < len(p) < 10}
+
+    if not cleaned_emails and not phone_10_digits and not other_phones:
+        return None
+
+    conditions = []
+    if cleaned_emails:
+        conditions.append(and_(LeadContact.contact_type == "email", func.lower(LeadContact.value).in_(cleaned_emails)))
+    for digits in phone_10_digits:
+        conditions.append(and_(LeadContact.contact_type == "phone", LeadContact.value.like(f"%{digits}%")))
+    for p in other_phones:
+        conditions.append(and_(LeadContact.contact_type == "phone", LeadContact.value.like(f"%{p}%")))
+
+    if not conditions:
+        return None
+
+    stmt = select(LeadContact, Lead).join(Lead, LeadContact.lead_id == Lead.id).where(or_(*conditions))
+    stmt = _owner_filter(stmt, user, Lead)
+    if exclude_lead_id:
+        stmt = stmt.where(Lead.id != exclude_lead_id)
+
+    candidates = db.execute(stmt).all()
+    for contact, lead in candidates:
+        if contact.contact_type == "email":
+            val = (contact.value or "").strip().casefold()
+            if val in cleaned_emails:
+                return lead, "email", contact.value
+        elif contact.contact_type == "phone":
+            c_digits = re.sub(r"\D", "", contact.value or "")
+            if len(c_digits) >= 10 and c_digits[-10:] in phone_10_digits:
+                return lead, "phone number", contact.value
+            elif c_digits and c_digits in other_phones:
+                return lead, "phone number", contact.value
+
+    return None
+
+
 def _filter_lead_statement(
     statement,
     *,
@@ -1259,6 +1310,31 @@ def create_lead(payload: LeadCreate, request: Request = None, db: Session = Depe
             existing = db.get(Lead, existing_key.lead_id)
             if existing:
                 return existing
+
+    company_name = (payload.company_name or "").strip()
+    raw_contacts = list(payload.contact_numbers or [])
+    if payload.contact_number and payload.contact_number not in raw_contacts:
+        raw_contacts.append(payload.contact_number)
+
+    cleaned_contacts = []
+    seen_contacts = set()
+    for item in raw_contacts:
+        val = str(item or "").strip()
+        if not val:
+            continue
+        normalized = _normalize_india_phone(val)
+        digits = re.sub(r"\D", "", normalized)
+        key = digits[-10:] if len(digits) >= 10 else digits or normalized
+        if key not in seen_contacts:
+            seen_contacts.add(key)
+            cleaned_contacts.append(normalized)
+
+    if not company_name or not cleaned_contacts:
+        raise HTTPException(
+            status_code=422,
+            detail="Company name and at least one contact number are required.",
+        )
+
     if (payload.raw_text or payload.document_id) and not payload.source_review_confirmed:
         raise HTTPException(status_code=422, detail="Compare the lead details with the available source before saving.")
     document = None
@@ -1269,13 +1345,19 @@ def create_lead(payload: LeadCreate, request: Request = None, db: Session = Depe
         if isinstance(user, User) and AUTH_REQUIRED and document.owner_id != user.id:
             raise HTTPException(status_code=404, detail="Source document not found.")
     values = payload.model_dump(exclude={"document_id", "source_document_ids", "source_sides", "document_card_index", "source_review_confirmed"})
-    if not values["contact_numbers"] and values["contact_number"]:
-        values["contact_numbers"] = [values["contact_number"]]
+    values["company_name"] = company_name
+    values["contact_numbers"] = cleaned_contacts
+    values["contact_number"] = cleaned_contacts[0]
     if not values["email_addresses"] and values["email"]:
         values["email_addresses"] = [values["email"]]
-    values["contact_numbers"] = [_normalize_india_phone(value) for value in values["contact_numbers"]]
-    values["contact_number"] = (values["contact_numbers"] or [None])[0]
     values["email"] = (values["email_addresses"] or [None])[0]
+    duplicate = _find_duplicate_lead(db, user, values["contact_numbers"], values["email_addresses"])
+    if duplicate:
+        lead_obj, match_type, match_val = duplicate
+        raise HTTPException(
+            status_code=409,
+            detail=f"Duplicate lead detected: A lead with this {match_type} ({match_val}) already exists as '{lead_obj.company_name}' ({lead_obj.lead_number}).",
+        )
     if document and not values["raw_text"]:
         values["raw_text"] = (document.extracted_fields or {}).get("raw_text")
     if document or values.get("original_ocr_text") or payload.source_document_ids:
@@ -1398,10 +1480,58 @@ def update_lead(lead_id: str, payload: LeadUpdate, db: Session = Depends(get_db)
     source_review_confirmed = updates.pop("source_review_confirmed", False)
     if (updates.get("raw_text", lead.raw_text) or lead.document_id) and not source_review_confirmed:
         raise HTTPException(status_code=422, detail="Compare the lead details with the available source before saving.")
-    if "company_name" in updates and updates["company_name"] is None:
-        raise HTTPException(status_code=422, detail="Company name is required.")
-    if lead.document_id or updates.get("original_ocr_text", lead.original_ocr_text):
-        _require_english_ocr({key: updates.get(key, getattr(lead, key)) for key in ("company_name", "owner_name", "designation", "business_description", "company_address", "raw_text")})
+    # Start duplicate checking with the lead's existing contacts. An edit that
+    # changes only the company name or another field must still use the current
+    # contact values and must not reference an uninitialized local variable.
+    phones_to_check = lead.contact_numbers
+    if "company_name" in updates:
+        comp = (updates["company_name"] or "").strip() if isinstance(updates["company_name"], str) else ""
+        if not comp:
+            raise HTTPException(status_code=422, detail="Company name and at least one contact number are required.")
+        updates["company_name"] = comp
+    if "contact_numbers" in updates or "contact_number" in updates:
+        raw_contacts = list(updates.get("contact_numbers") or ([updates["contact_number"]] if updates.get("contact_number") else []))
+        cleaned_contacts = []
+        seen_contacts = set()
+        for item in raw_contacts:
+            val = str(item or "").strip()
+            if not val:
+                continue
+            normalized = _normalize_india_phone(val)
+            digits = re.sub(r"\D", "", normalized)
+            key = digits[-10:] if len(digits) >= 10 else digits or normalized
+            if key not in seen_contacts:
+                seen_contacts.add(key)
+                cleaned_contacts.append(normalized)
+        if not cleaned_contacts:
+            raise HTTPException(status_code=422, detail="Company name and at least one contact number are required.")
+        phones_to_check = cleaned_contacts
+        updates["contact_numbers"] = cleaned_contacts
+        updates["contact_number"] = cleaned_contacts[0]
+    emails_to_check = lead.email_addresses
+    if "email_addresses" in updates:
+        emails_to_check = updates["email_addresses"] or []
+    elif "email" in updates:
+        emails_to_check = [updates["email"]] if updates["email"] else []
+
+    # Apply the same Latin-letter structured-field rule used by create_lead to
+    # edits of OCR-backed leads. Raw OCR may remain in its source fields, but a
+    # structured company/person/address value must be corrected before saving.
+    if lead.document_id or lead.raw_text or lead.original_ocr_text:
+        candidate_values = {
+            key: updates.get(key, getattr(lead, key, None))
+            for key in ("company_name", "owner_name", "designation", "business_description", "company_address")
+        }
+        _require_english_ocr(candidate_values)
+
+    duplicate = _find_duplicate_lead(db, user, phones_to_check, emails_to_check, exclude_lead_id=lead_id)
+    if duplicate:
+        lead_obj, match_type, match_val = duplicate
+        raise HTTPException(
+            status_code=409,
+            detail=f"Duplicate lead detected: Another lead with this {match_type} ({match_val}) already exists as '{lead_obj.company_name}' ({lead_obj.lead_number}).",
+        )
+
     contact_fields = {"contact_number", "contact_numbers", "email", "email_addresses"}
     for key, value in updates.items():
         if key not in contact_fields:
@@ -1421,9 +1551,29 @@ def update_lead(lead_id: str, payload: LeadUpdate, db: Session = Depends(get_db)
     return _lead_read(lead)
 
 
+@app.post("/api/leads/check-duplicate", response_model=DuplicateCheckResponse)
+def check_duplicate_lead(
+    payload: DuplicateCheckRequest, db: Session = Depends(get_db), user: User = Depends(require_user)
+):
+    duplicate = _find_duplicate_lead(
+        db, user, payload.contact_numbers, payload.email_addresses, exclude_lead_id=payload.exclude_lead_id
+    )
+    if duplicate:
+        lead_obj, match_type, match_value = duplicate
+        return DuplicateCheckResponse(
+            is_duplicate=True,
+            existing_lead_id=lead_obj.id,
+            existing_lead_number=lead_obj.lead_number,
+            existing_company_name=lead_obj.company_name,
+            matched_type=match_type,
+            matched_value=match_value,
+        )
+    return DuplicateCheckResponse(is_duplicate=False)
+
+
 @app.post("/api/leads/batch", status_code=201)
 def create_leads_batch(payload: list[LeadFields], db: Session = Depends(get_db), user: User = Depends(require_user)):
-    """Explicit one-click import; leave imported rows flagged for user review."""
+    """Explicit one-click import; leave imported rows flagged for user review, skipping duplicates."""
     if not payload:
         raise HTTPException(status_code=400, detail="No valid lead rows were provided.")
     # Flush bounded chunks while keeping one transaction.  This allows large
@@ -1431,6 +1581,9 @@ def create_leads_batch(payload: list[LeadFields], db: Session = Depends(get_db),
     # partially committed imports if a later row fails validation.
     batch_size = 1000
     created_count = 0
+    skipped_duplicates = 0
+    seen_phones: set[str] = set()
+    seen_emails: set[str] = set()
     try:
         for start in range(0, len(payload), batch_size):
             for item in payload[start:start + batch_size]:
@@ -1442,16 +1595,34 @@ def create_leads_batch(payload: list[LeadFields], db: Session = Depends(get_db),
                 values["contact_numbers"] = [_normalize_india_phone(value) for value in values["contact_numbers"]]
                 values["contact_number"] = (values["contact_numbers"] or [None])[0]
                 values["email"] = (values["email_addresses"] or [None])[0]
+
+                # Check duplicates in-batch
+                row_phones = [re.sub(r"\D", "", p)[-10:] for p in values["contact_numbers"] if len(re.sub(r"\D", "", p)) >= 10]
+                row_emails = [e.strip().casefold() for e in values["email_addresses"] if e and e.strip()]
+
+                if (row_phones and any(p in seen_phones for p in row_phones)) or (row_emails and any(e in seen_emails for e in row_emails)):
+                    skipped_duplicates += 1
+                    continue
+
+                if _find_duplicate_lead(db, user, values["contact_numbers"], values["email_addresses"]):
+                    skipped_duplicates += 1
+                    continue
+
+                for p in row_phones:
+                    seen_phones.add(p)
+                for e in row_emails:
+                    seen_emails.add(e)
+
                 db.add(Lead(**values, verification_status="needs_review",
                             owner_id=user.id if isinstance(user, User) else None))
+                created_count += 1
             db.flush()
-            created_count += min(batch_size, len(payload) - start)
             db.expunge_all()
         db.commit()
     except Exception:
         db.rollback()
         raise
-    return {"created": created_count}
+    return {"created": created_count, "skipped_duplicates": skipped_duplicates}
 
 
 @app.delete("/api/leads/{lead_id}", status_code=204)
@@ -1471,6 +1642,21 @@ EXPORT_LEAD_HEADERS = [
 EXPORT_END_HEADERS = ["Website", "Facebook link", "Instagram link", "WhatsApp link", "Business description", "Other document text"]
 
 
+def _sanitize_export_filename(name: str | None) -> str:
+    if not isinstance(name, str) or not name.strip():
+        return "leads.xlsx"
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", name)
+    cleaned = re.sub(r"[/\\]", "", cleaned)
+    cleaned = re.sub(r'[:*?"<>|]', "", cleaned)
+    cleaned = re.sub(r"(\.xlsx)+$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"^\.+|\.+$", "", cleaned).strip()
+    cleaned = cleaned[:120].strip()
+    if not cleaned:
+        return "leads.xlsx"
+    return f"{cleaned}.xlsx"
+
+
 @app.get("/api/exports/leads")
 def export_leads(
     search: str | None = None,
@@ -1480,12 +1666,14 @@ def export_leads(
     city: str | None = None,
     state: str | None = None,
     export_count: int | None = Query(default=None, ge=1),
+    filename: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(require_user),
 ):
+    ids_list = ids if isinstance(ids, list) else []
     statement = select(Lead).order_by(Lead.created_at.desc(), Lead.id.desc())
-    if ids:
-        statement = statement.where(Lead.id.in_(ids))
+    if ids_list:
+        statement = statement.where(Lead.id.in_(ids_list))
     else:
         statement = _filter_lead_statement(
             statement, search=search, company_name=company_name, owner_name=owner_name, city=city, state=state,
@@ -1494,7 +1682,7 @@ def export_leads(
     selected_id_query = statement.with_only_columns(Lead.id, maintain_column_froms=True).order_by(
         Lead.created_at.desc(), Lead.id.desc()
     )
-    if export_count is not None:
+    if isinstance(export_count, int) and export_count > 0:
         selected_id_query = selected_id_query.limit(export_count)
     selected_ids = selected_id_query.subquery()
     selected_count = db.scalar(select(func.count()).select_from(selected_ids)) or 0
@@ -1634,9 +1822,10 @@ def export_leads(
         workbook.save(output)
         output.seek(0)
         background = None
+    download_name = _sanitize_export_filename(filename)
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="leads.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
         background=background,
     )

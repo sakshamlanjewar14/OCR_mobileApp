@@ -1,8 +1,10 @@
-import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./details.css";
 import { clearLeadDraft, enqueueLead, readLeadDraft, readLeadQueue, removeQueuedLead, saveLeadDraft } from "./draftStore";
 import { decodeQrFromVideo, parseQrLocally, recognizeCard, scanQrImage } from "./clientOcr";
 import { startQrScanLoop } from "./qrScanner";
+import { DEFAULT_EXPORT_BASE_NAME, executeExportFlow, sanitizeExportFileName, validateExportResponse } from "./exportFileName";
+import { validateLead } from "./leadValidation";
 
 // Development uses the Vite same-origin proxy so cookie authentication is not
 // blocked by browser CORS. Production keeps the configured API origin.
@@ -83,6 +85,14 @@ type RawCandidate = { source: string; row: number; fields: ExtractedLeadFields }
 type RawPreviewResult = { filename: string; candidates: { row: number; fields: ExtractedLeadFields }[] };
 type QRResult = { source_text?: string; contacts?: string[]; emails?: string[]; urls?: string[]; [key: string]: unknown };
 type WebsitePreview = { url: string; fields: Record<string, unknown>; source_text: string; warnings: string[] };
+type DuplicateCheckResult = {
+  is_duplicate: boolean;
+  existing_lead_id?: string | null;
+  existing_lead_number?: string | null;
+  existing_company_name?: string | null;
+  matched_type?: string | null;
+  matched_value?: string | null;
+};
 type LeadPage = { leads: Lead[]; total: number; page: number; page_size: number };
 const LEADS_PAGE_SIZE = 50;
 
@@ -96,11 +106,11 @@ async function optimizeCameraPhoto(blob: Blob): Promise<Blob> {
     return blob;
   }
   try {
-    // The backend OCR pipeline already caps images at 2200 px. Sending an
+    // The backend OCR pipeline caps images at 1600 px. Sending an
     // 8–12 MP phone photo over cellular only adds upload time without giving
     // OCR more pixels to read, so retain that effective resolution at high
     // JPEG quality before upload.
-    const scale = Math.min(1, 2200 / Math.max(bitmap.width, bitmap.height));
+    const scale = Math.min(1, 1600 / Math.max(bitmap.width, bitmap.height));
     const canvas = window.document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(bitmap.width * scale));
     canvas.height = Math.max(1, Math.round(bitmap.height * scale));
@@ -423,6 +433,17 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 type AuthUser = { id: string; full_name: string; email: string; is_verified: boolean };
 
+function userDisplayName(user?: AuthUser | null): string {
+  if (!user) return "Account";
+  const trimmed = (user.full_name || "").trim();
+  if (trimmed) return trimmed;
+  if (user.email && user.email.includes("@")) {
+    const username = user.email.split("@")[0].trim();
+    if (username) return username;
+  }
+  return "Account";
+}
+
 function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [leadTotal, setLeadTotal] = useState(0);
@@ -462,8 +483,25 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   const [sourceDocumentIds, setSourceDocumentIds] = useState<string[]>([]);
   const [form, setForm] = useState<LeadForm>(emptyForm);
   const [editingLead, setEditingLead] = useState<Lead | null>(null);
+  const [duplicateInfo, setDuplicateInfo] = useState<DuplicateCheckResult | null>(null);
   const [viewingLead, setViewingLead] = useState<Lead | null>(null);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportFileNameInput, setExportFileNameInput] = useState(DEFAULT_EXPORT_BASE_NAME);
+  const [exportFileNameError, setExportFileNameError] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const exportInputRef = useRef<HTMLInputElement>(null);
+  const companyInputRef = useRef<HTMLInputElement>(null);
+  const contactNumbersRef = useRef<HTMLTextAreaElement>(null);
   const [reviewedFingerprint, setReviewedFingerprint] = useState("");
+
+  useEffect(() => {
+    if (exportDialogOpen) {
+      window.setTimeout(() => {
+        exportInputRef.current?.focus();
+        exportInputRef.current?.select();
+      }, 50);
+    }
+  }, [exportDialogOpen]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -510,6 +548,78 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
       setError(err instanceof Error ? err.message : "Could not load scan status.");
     }
   }, []);
+
+  const duplicateLeadIds = useMemo(() => {
+    const phoneMap = new Map<string, string>();
+    const emailMap = new Map<string, string>();
+    const dupes = new Set<string>();
+
+    for (const item of leads) {
+      const phones = item.contact_numbers?.length ? item.contact_numbers : item.contact_number ? [item.contact_number] : [];
+      for (const phone of phones) {
+        const digits = phone.replace(/\D/g, "");
+        const key = digits.length >= 10 ? digits.slice(-10) : digits;
+        if (key) {
+          if (phoneMap.has(key)) {
+            dupes.add(item.id);
+            dupes.add(phoneMap.get(key)!);
+          } else {
+            phoneMap.set(key, item.id);
+          }
+        }
+      }
+      const emails = item.email_addresses?.length ? item.email_addresses : item.email ? [item.email] : [];
+      for (const em of emails) {
+        const key = em.trim().toLowerCase();
+        if (key) {
+          if (emailMap.has(key)) {
+            dupes.add(item.id);
+            dupes.add(emailMap.get(key)!);
+          } else {
+            emailMap.set(key, item.id);
+          }
+        }
+      }
+    }
+    return dupes;
+  }, [leads]);
+
+  useEffect(() => {
+    if (tab !== "form") {
+      setDuplicateInfo(null);
+      return;
+    }
+    const hasContacts = form.contact_numbers.some((num) => num.trim()) || form.email_addresses.some((em) => em.trim());
+    if (!hasContacts) {
+      setDuplicateInfo(null);
+      return;
+    }
+
+    let active = true;
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await api<DuplicateCheckResult>("/leads/check-duplicate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contact_numbers: form.contact_numbers,
+            email_addresses: form.email_addresses,
+            exclude_lead_id: editingLead?.id || null,
+          }),
+        });
+        if (active) {
+          setDuplicateInfo(result.is_duplicate ? result : null);
+        }
+      } catch {
+        // Live duplicate check failed; save action still validates on server
+      }
+    }, 250);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [tab, form.contact_numbers, form.email_addresses, editingLead?.id]);
 
   useEffect(() => { void loadLeads(); }, [loadLeads]);
   useEffect(() => { void loadScanIssues(); }, [loadScanIssues]);
@@ -687,7 +797,7 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
     setScanStage(pendingDocuments.some((item) => item.processing_status === "processing")
       ? "Reading card and extracting details"
       : "Waiting for the scanner");
-    const retryDelay = statusRetryCountRef.current ? Math.min(8000, 2000 * (2 ** Math.min(statusRetryCountRef.current - 1, 2))) : 2000;
+    const retryDelay = statusRetryCountRef.current ? Math.min(8000, 1000 * (2 ** Math.min(statusRetryCountRef.current - 1, 2))) : 350;
     const timer = window.setTimeout(async () => {
       try {
         const statuses = await api<DocumentStatus[]>("/documents/status", {
@@ -1034,13 +1144,15 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
       // Keep mobile request bodies small and let the API commit bounded ORM
       // chunks. This avoids one huge JSON payload for large spreadsheet imports.
       let created = 0;
+      let skippedDuplicates = 0;
       for (let start = 0; start < validCandidates.length; start += 1000) {
-        const result = await api<{ created: number }>("/leads/batch", {
+        const result = await api<{ created: number; skipped_duplicates?: number }>("/leads/batch", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(validCandidates.slice(start, start + 1000)),
         });
         created += result.created;
+        skippedDuplicates += result.skipped_duplicates || 0;
       }
       setLeadPage(1);
       await loadLeads(1);
@@ -1048,7 +1160,9 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
       setRawCandidateIndex(0);
       setForm(emptyForm);
       setTab("leads");
-      setNotice(`${created} lead${created === 1 ? "" : "s"} generated. ${skipped ? `${skipped} row${skipped === 1 ? " was" : "s were"} skipped because the company name was blank. ` : ""}Generated records are marked Check data until reviewed.`);
+      const blankMsg = skipped ? `${skipped} row${skipped === 1 ? " was" : "s were"} skipped because the company name was blank. ` : "";
+      const dupMsg = skippedDuplicates ? `${skippedDuplicates} duplicate row${skippedDuplicates === 1 ? " was" : "s were"} skipped to prevent duplicate data. ` : "";
+      setNotice(`${created} lead${created === 1 ? "" : "s"} generated. ${blankMsg}${dupMsg}Generated records are marked Check data until reviewed.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not generate leads from the Excel file.");
     } finally {
@@ -1217,6 +1331,25 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
     event.preventDefault();
     setError("");
     setNotice("");
+
+    // Validate required fields: company_name and at least one contact_number
+    const validation = validateLead({ company_name: form.company_name, contact_numbers: form.contact_numbers });
+    if (!validation.valid) {
+      setError(validation.error || "Company name and at least one contact number are required.");
+      if (validation.firstMissingField === "company_name") {
+        companyInputRef.current?.focus();
+      } else {
+        contactNumbersRef.current?.focus();
+      }
+      return;
+    }
+    const trimmedCompany = validation.trimmedCompanyName;
+    const cleanedContactNumbers = validation.cleanedContactNumbers;
+
+    if (duplicateInfo?.is_duplicate) {
+      setError(`Cannot save duplicate lead: A lead with this ${duplicateInfo.matched_type} (${duplicateInfo.matched_value}) already exists as "${duplicateInfo.existing_company_name}" (${duplicateInfo.existing_lead_number}).`);
+      return;
+    }
     if (needsSourceReview && !sourceReviewConfirmed) {
       setError("Compare the lead details with the source, correct any mismatches, and confirm the check before saving.");
       return;
@@ -1224,12 +1357,13 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
     setBusy(true);
     const payload = {
       ...form,
+      company_name: trimmedCompany,
       owner_name: form.owner_name || null,
       designation: form.designation || null,
       business_description: form.business_description || null,
       company_address: form.company_address || null,
-      contact_numbers: form.contact_numbers,
-      contact_number: form.contact_numbers[0] || null,
+      contact_numbers: cleanedContactNumbers,
+      contact_number: cleanedContactNumbers[0] || null,
       email_addresses: form.email_addresses,
       email: form.email_addresses[0] || null,
       raw_text: form.raw_text || null,
@@ -1280,6 +1414,7 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
         setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; });
         setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; });
         setEditingLead(null);
+        setDuplicateInfo(null);
         setRawCandidates([]);
         setRawCandidateIndex(0);
         setForm(emptyForm);
@@ -1333,52 +1468,70 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
     }
   }
 
-  async function exportLeads() {
-    try {
-      setError("");
-      if (exportCount.trim() && (!Number.isInteger(Number(exportCount)) || Number(exportCount) < 1)) {
-        throw new Error("Enter a whole number above zero, or clear Rows to export to export all matching leads.");
-      }
-      const params = new URLSearchParams();
-      if (selected.size) selected.forEach((id) => params.append("ids", id));
-      else {
-        if (search.trim()) params.set("search", search.trim());
-        if (companyFilter.trim()) params.set("company_name", companyFilter.trim());
-        if (ownerFilter.trim()) params.set("owner_name", ownerFilter.trim());
-        if (cityFilter.trim()) params.set("city", cityFilter.trim());
-        if (stateFilter.trim()) params.set("state", stateFilter.trim());
-      }
-      if (exportCount.trim()) params.set("export_count", String(Number(exportCount)));
-      const response = await fetch(`${API}/exports/leads?${params.toString()}`, {
-        credentials: "include",
-        headers: { "X-Request-ID": crypto.randomUUID?.() || `export-${Date.now()}` },
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(body?.detail || `Could not create spreadsheet (${response.status}).`);
-      }
-      const blob = await response.blob();
-      const file = new File([blob], "leads.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      // Android/iOS browsers may ignore a synthetic download click. Prefer
-      // the native share sheet when it can accept the generated workbook.
-      if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) {
-        await navigator.share({ files: [file], title: "Lead Gennie export" });
-        setNotice("Spreadsheet ready. Choose an app to save or share it.");
-      } else {
-        const url = URL.createObjectURL(blob);
-        const anchor = window.document.createElement("a");
-        anchor.href = url;
-        anchor.download = "leads.xlsx";
-        anchor.rel = "noopener";
-        window.document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-        setNotice("Spreadsheet downloaded. You can now share the file.");
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Export failed.");
+  function openExportDialog() {
+    setError("");
+    if (exportCount.trim() && (!Number.isInteger(Number(exportCount)) || Number(exportCount) < 1)) {
+      setError("Enter a whole number above zero, or clear Rows to export to export all matching leads.");
+      return;
     }
+    setExportFileNameInput(DEFAULT_EXPORT_BASE_NAME);
+    setExportFileNameError("");
+    setExportDialogOpen(true);
+  }
+
+  function handleCancelExport() {
+    if (exporting) return;
+    setExportDialogOpen(false);
+    setExportFileNameError("");
+  }
+
+  async function handleConfirmExport() {
+    if (exporting) return;
+    const effectiveInput = exportFileNameInput.trim() || DEFAULT_EXPORT_BASE_NAME;
+    const validation = sanitizeExportFileName(effectiveInput);
+    if (!validation.valid) {
+      setExportFileNameError(validation.error || "Enter a valid file name.");
+      return;
+    }
+    setExporting(true);
+    setExportFileNameError("");
+    setError("");
+    try {
+      await performExport(validation.sanitizedBaseName, validation.finalFileName);
+      setExportDialogOpen(false);
+      setExportFileNameError("");
+      setError("");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Export failed.";
+      setExportFileNameError(msg);
+      setError(msg);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function performExport(sanitizedBaseName: string, finalFileName: string) {
+    if (exportCount.trim() && (!Number.isInteger(Number(exportCount)) || Number(exportCount) < 1)) {
+      throw new Error("Enter a whole number above zero, or clear Rows to export to export all matching leads.");
+    }
+    const params = new URLSearchParams();
+    if (selected.size) selected.forEach((id) => params.append("ids", id));
+    else {
+      if (search.trim()) params.set("search", search.trim());
+      if (companyFilter.trim()) params.set("company_name", companyFilter.trim());
+      if (ownerFilter.trim()) params.set("owner_name", ownerFilter.trim());
+      if (cityFilter.trim()) params.set("city", cityFilter.trim());
+      if (stateFilter.trim()) params.set("state", stateFilter.trim());
+    }
+    if (exportCount.trim()) params.set("export_count", String(Number(exportCount)));
+    if (sanitizedBaseName) params.set("filename", sanitizedBaseName);
+    const response = await fetch(`${API}/exports/leads?${params.toString()}`, {
+      credentials: "include",
+      headers: { "X-Request-ID": crypto.randomUUID?.() || `export-${Date.now()}` },
+    });
+    const blob = await validateExportResponse(response);
+    const result = await executeExportFlow({ blob, finalFileName });
+    setNotice(result.message);
   }
 
   function toggleSelected(id: string) {
@@ -1392,11 +1545,22 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setTab("leads"); }}>
-          <span className="brand-mark">L</span>
-          <span>Lead Gennie<small>{user.full_name} · Document to lead</small></span>
+        <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setTab("leads"); }} aria-label="Lead Gennie home">
+          <span className="brand-mark" aria-hidden="true">L</span>
+          <span>Lead Gennie<small>Document to lead</small></span>
         </a>
-        <button className="button button-secondary auth-logout" type="button" onClick={onLogout}>Log out</button>
+        <div className="topbar-right" aria-label="User account and session">
+          <span
+            className="topbar-user-name"
+            title={user.full_name?.trim() || user.email || "Account"}
+            aria-label={`Signed in as ${userDisplayName(user)}`}
+          >
+            {userDisplayName(user)}
+          </span>
+          <button className="button button-secondary auth-logout" type="button" onClick={onLogout} aria-label="Log out of Lead Gennie">
+            Log out
+          </button>
+        </div>
       </header>
 
       <main className="page">
@@ -1433,7 +1597,7 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
               <div className="search-wrap"><span aria-hidden="true">⌕</span><input value={search} onChange={(event) => { setSearch(event.target.value); setLeadPage(1); }} placeholder="Search company, contact, location..." aria-label="Search leads" /></div>
               <div className="toolbar-actions"><span className="result-count">{leadTotal} {leadTotal === 1 ? "lead" : "leads"}</span>
                 <label className="export-count-field"><span>Rows to export</span><input type="number" min="1" step="1" inputMode="numeric" value={exportCount} onChange={(event) => setExportCount(event.target.value)} placeholder="All" aria-label="Number of leads to export" /></label>
-                <button className="button button-secondary" onClick={() => void exportLeads()} disabled={!leadTotal && !selected.size}>Export {selected.size ? `${selected.size} selected` : "Excel"}</button>
+                <button className="button button-secondary" onClick={openExportDialog} disabled={(!leadTotal && !selected.size) || exporting}>{exporting ? "Creating Excel file…" : `Export ${selected.size ? `${selected.size} selected` : "Excel"}`}</button>
                 <button className="button button-primary" onClick={startManualEntry}>＋ Add lead</button>
               </div>
             </div>
@@ -1449,7 +1613,10 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
               <td className="serial-cell">{(leadPage - 1) * LEADS_PAGE_SIZE + index + 1}</td>
               <td className="check-cell"><input type="checkbox" checked={selected.has(lead.id)} onChange={() => toggleSelected(lead.id)} aria-label={`Select ${lead.company_name}`} /></td>
               <td><button className="company-link" onClick={() => editLead(lead)}>{lead.company_name}<small>{lead.lead_number}</small></button></td>
-              <td><span className={`verification-pill ${lead.verification_status === "verified" ? "verified" : "needs-review"}`}>{lead.verification_status === "verified" ? "Checked" : lead.document_id ? "Check OCR" : "Check data"}</span></td>
+              <td>
+                <span className={`verification-pill ${lead.verification_status === "verified" ? "verified" : "needs-review"}`}>{lead.verification_status === "verified" ? "Checked" : lead.document_id ? "Check OCR" : "Check data"}</span>
+                {duplicateLeadIds.has(lead.id) && <div><span className="verification-pill duplicate-pill" title="Shares phone number or email address with another lead in this list">Duplicate</span></div>}
+              </td>
               <td>{lead.owner_name || <span className="muted">—</span>}</td>
               <td>{lead.designation || <span className="muted">—</span>}</td>
               <td className="address-cell">{lead.company_address || <span className="muted">—</span>}</td>
@@ -1486,11 +1653,12 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
               </div>}
               {!document && !editingLead && <div className="candidate-summary"><span className="eyebrow">{rawCandidates.length ? "RAW DATA REVIEW" : localPreviewUrl ? "LOCAL OCR REVIEW" : "MANUAL ENTRY"}</span><p>{rawCandidates.length ? `${rawCandidates[rawCandidateIndex]?.source} · Row ${rawCandidates[rawCandidateIndex]?.row} · ${rawCandidateIndex + 1} of ${rawCandidates.length}. Review rows individually or generate the remaining Excel leads at once.` : localPreviewUrl ? "OCR ran on this device. Review the fields; images remain local until Save." : "Enter company information below, then select Save lead."}</p>{localConflicts.length > 0 && <div className="review-warning"><strong>Conflicting values found across card images:</strong><ul>{localConflicts.map((item) => <li key={item}>{item}</li>)}</ul><p>Review and keep the value that matches the card.</p></div>}{ocrFallbackFiles.length > 0 && <div className="review-warning"><p>Browser OCR could not reliably read this image. It has not been uploaded.</p><div className="form-actions"><button type="button" className="button button-secondary" disabled={busy} onClick={() => void uploadFiles(ocrFallbackFiles, false, false, false)}>Retry locally</button><button type="button" className="button button-primary" disabled={busy} onClick={() => void uploadFiles(ocrFallbackFiles, false, false, true)}>Continue with server OCR</button><button type="button" className="text-button" disabled={busy} onClick={() => { setOcrFallbackFiles([]); setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; }); setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; }); setTab("leads"); }}>Cancel</button></div></div>}{canBulkGenerate && <button type="button" className="button button-primary generate-batch-button" onClick={() => void generateAllExcelLeads()} disabled={busy}>{busy ? "Generating leads…" : `Generate ${rawCandidates.slice(rawCandidateIndex).length} remaining leads in one click`}</button>}</div>}
               <div className="form-heading"><span className="eyebrow">LEAD INFORMATION</span><h2>{editingLead ? editingLead.lead_number : document?.extracted_fields.cards && document.extracted_fields.cards.length > 1 ? `Card ${activeCardIndex + 1} of ${document.extracted_fields.cards.length}` : "Add lead"}</h2><p>{editingLead ? "Correct any details, then save your changes." : "Enter the company information and save the lead."}</p></div>
+              {error && <div className="alert alert-error form-error" role="alert">{error}</div>}
               <form onSubmit={saveLead}>
                 {fields.map((field) => <label className="field" key={field.key}><span>{field.label}{field.key === "company_name" && <b>Required</b>}</span>
-                {field.key === "company_address" || field.key === "business_description" ? <textarea rows={3} value={form[field.key]} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} /> : <input value={form[field.key] || ""} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} required={field.key === "company_name"} />}
+                {field.key === "company_address" || field.key === "business_description" ? <textarea rows={3} value={form[field.key]} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} /> : <input ref={field.key === "company_name" ? companyInputRef : undefined} value={form[field.key] || ""} onChange={(event) => setForm((current) => updateFormField(current, { [field.key]: event.target.value }))} placeholder={field.placeholder} required={field.key === "company_name"} />}
                 </label>)}
-                <label className="field"><span>Contact numbers <small>One per line</small></span><textarea rows={3} value={form.contact_numbers.join("\n")} onChange={(event) => setForm((current) => updateFormField(current, { contact_numbers: listFromText(event.target.value) }))} placeholder={"+91 98765 43210\n+91 98765 43211"} /></label>
+                <label className="field"><span>Contact numbers <small>One per line</small> <b>Required</b></span><textarea ref={contactNumbersRef} rows={3} value={form.contact_numbers.join("\n")} onChange={(event) => setForm((current) => updateFormField(current, { contact_numbers: listFromText(event.target.value) }))} placeholder={"+91 98765 43210\n+91 98765 43211"} /></label>
                 <label className="field"><span>Email addresses <small>One per line</small></span><textarea rows={3} value={form.email_addresses.join("\n")} onChange={(event) => setForm((current) => updateFormField(current, { email_addresses: listFromText(event.target.value, /[\n;,]+/) }))} placeholder="name@company.com&#10;sales@company.com" /></label>
                 <label className="field"><span>Other text from document <small>Edit labeled lines here to update the matching fields automatically</small></span><textarea className="raw-text-area" rows={6} value={form.raw_text} onChange={(event) => setForm((current) => updateFormFromDocumentText(current, event.target.value))} placeholder="All readable text from the source document appears here." /></label>
                 {needsSourceReview && <section className="review-check" aria-labelledby="review-check-title">
@@ -1498,7 +1666,13 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
                   {!hasOcrText ? <p className="review-warning">Source text is unavailable. Compare every field directly with the original source.</p> : mismatches.length ? <><p className="review-warning">Check these possible mismatches against the original. Correct any errors before saving:</p><ul>{mismatches.map((item) => <li key={item}>{item}</li>)}</ul></> : <p className="review-match">Structured values are consistent with the stored source text. OCR can still misread characters, so compare them with the original source.</p>}
                   <label className="review-confirm"><input type="checkbox" checked={sourceReviewConfirmed} onChange={(event) => setReviewedFingerprint(event.target.checked ? formFingerprint : "")} /><span>I compared the lead details with the available source and corrected any mismatches.</span></label>
                 </section>}
-                <div className="form-actions">{rawCandidates.length > 0 && !editingLead && <button type="button" className="button button-secondary" onClick={() => setTab("leads")}>Back to leads</button>}<button type="button" className="button button-secondary" onClick={() => { setTab("leads"); setDocument(null); setOcrFallbackFiles([]); setLocalOriginalOcrText(""); setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; }); setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; }); setEditingLead(null); setError(""); setBusy(false); }}>Cancel</button><button className="button button-primary" disabled={busy || Boolean(editingLead?.document_id && !document)}>{busy ? "Working…" : editingLead ? "Save changes" : rawCandidates.length > 0 && rawCandidateIndex + 1 < rawCandidates.length ? "Save & continue" : "Save lead"}</button></div>
+                {duplicateInfo?.is_duplicate && (
+                  <div className="review-warning duplicate-warning" role="alert">
+                    <strong>⚠️ Duplicate Lead Detected:</strong> A lead with this {duplicateInfo.matched_type} (<code>{duplicateInfo.matched_value}</code>) already exists as <strong>{duplicateInfo.existing_company_name}</strong> ({duplicateInfo.existing_lead_number}).
+                    <p>Saving is blocked to prevent duplicate data in the database.</p>
+                  </div>
+                )}
+                <div className="form-actions">{rawCandidates.length > 0 && !editingLead && <button type="button" className="button button-secondary" onClick={() => setTab("leads")}>Back to leads</button>}<button type="button" className="button button-secondary" onClick={() => { setTab("leads"); setDocument(null); setOcrFallbackFiles([]); setLocalOriginalOcrText(""); setLocalPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return ""; }); setLocalPreviewUrls((current) => { current.forEach((url) => URL.revokeObjectURL(url)); return []; }); setEditingLead(null); setError(""); setBusy(false); setDuplicateInfo(null); }}>Cancel</button><button className="button button-primary" disabled={busy || Boolean(editingLead?.document_id && !document) || Boolean(duplicateInfo?.is_duplicate)}>{busy ? "Working…" : editingLead ? "Save changes" : rawCandidates.length > 0 && rawCandidateIndex + 1 < rawCandidates.length ? "Save & continue" : "Save lead"}</button></div>
               </form>
             </div>
           </section>
@@ -1531,6 +1705,99 @@ function LeadApp({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
             <footer className="details-actions"><button className="button button-secondary" onClick={() => setViewingLead(null)}>Close</button><button className="button button-primary" onClick={() => { setViewingLead(null); void editLead(viewingLead); }}>Edit lead</button></footer>
           </section>
         </div>}
+        {exportDialogOpen && (
+          <div
+            className="export-backdrop"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !exporting) {
+                handleCancelExport();
+              }
+            }}
+          >
+            <section
+              className="export-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="export-dialog-title"
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && !exporting) {
+                  event.stopPropagation();
+                  handleCancelExport();
+                }
+              }}
+            >
+              <header>
+                <div>
+                  <span className="eyebrow">SPREADSHEET EXPORT</span>
+                  <h2 id="export-dialog-title">Export leads</h2>
+                  <p className="export-dialog-copy">
+                    {selected.size
+                      ? `Exporting ${selected.size} selected lead${selected.size === 1 ? "" : "s"}.`
+                      : exportCount.trim()
+                      ? `Exporting up to ${exportCount.trim()} matching lead${Number(exportCount.trim()) === 1 ? "" : "s"}.`
+                      : `Exporting all ${leadTotal} matching lead${leadTotal === 1 ? "" : "s"}.`}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="details-close"
+                  aria-label="Close export dialog"
+                  disabled={exporting}
+                  onClick={handleCancelExport}
+                >
+                  ×
+                </button>
+              </header>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleConfirmExport();
+                }}
+              >
+                <div className="field">
+                  <label htmlFor="export-file-name">File name</label>
+                  <input
+                    ref={exportInputRef}
+                    id="export-file-name"
+                    type="text"
+                    value={exportFileNameInput}
+                    onChange={(event) => {
+                      setExportFileNameInput(event.target.value);
+                      if (exportFileNameError) setExportFileNameError("");
+                    }}
+                    placeholder={DEFAULT_EXPORT_BASE_NAME}
+                    className={exportFileNameError ? "has-error" : ""}
+                    aria-invalid={Boolean(exportFileNameError)}
+                    aria-describedby={exportFileNameError ? "export-file-error" : undefined}
+                    disabled={exporting}
+                    autoFocus
+                  />
+                </div>
+                <div className="export-dialog-error" id="export-file-error" role="alert">
+                  {exportFileNameError || ""}
+                </div>
+                <div className="export-dialog-actions">
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={handleCancelExport}
+                    disabled={exporting}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="button button-primary"
+                    disabled={exporting}
+                  >
+                    {exporting ? "Creating Excel file…" : "Export"}
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
         <footer>Lead Gennie <span>·</span> Scan, save, and organize business contacts</footer>
       </main>
     </div>

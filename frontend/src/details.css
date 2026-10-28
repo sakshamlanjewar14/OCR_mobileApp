@@ -48,6 +48,7 @@
 .verification-pill{display:inline-block;border-radius:12px;padding:4px 7px;font-size:9px;font-weight:700;white-space:nowrap}
 .verification-pill.verified{background:#edf5ef;color:#397552}
 .verification-pill.needs-review{background:#fff5df;color:#92702e}
+.verification-pill.duplicate-pill{background:#ffebee;color:#c62828;border:1px solid #ffcdd2}
 @media(max-width:600px){.review-queue{padding:14px}.review-queue li{align-items:flex-start}.review-queue li .button{padding:8px 10px;white-space:normal}}
 .pagination-controls{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 18px;border-top:1px solid #edf0eb;color:#7b867c;font-size:11px}
 .pagination-controls>div{display:flex;align-items:center;gap:10px}

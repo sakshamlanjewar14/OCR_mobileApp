@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class LeadFields(BaseModel):
-    company_name: str = Field(min_length=1, max_length=255)
+    company_name: str = Field(default="", max_length=255)
     owner_name: str | None = Field(default=None, max_length=255)
     designation: str | None = Field(default=None, max_length=120)
     business_description: str | None = None
@@ -123,3 +123,18 @@ class UserRead(BaseModel):
     full_name: str
     email: str
     is_verified: bool
+
+
+class DuplicateCheckRequest(BaseModel):
+    contact_numbers: list[str] = Field(default_factory=list)
+    email_addresses: list[str] = Field(default_factory=list)
+    exclude_lead_id: str | None = None
+
+
+class DuplicateCheckResponse(BaseModel):
+    is_duplicate: bool = False
+    existing_lead_id: str | None = None
+    existing_lead_number: str | None = None
+    existing_company_name: str | None = None
+    matched_type: str | None = None
+    matched_value: str | None = None

@@ -35,9 +35,9 @@ class DocumentReviewFlowTests(unittest.TestCase):
             db.refresh(first_user)
             db.refresh(second_user)
             request = Request({"type": "http", "method": "POST", "path": "/api/leads", "headers": [(b"x-idempotency-key", b"same-key")]})
-            first = main.create_lead(LeadCreate(company_name="Acme"), request, db, first_user)
-            replay = main.create_lead(LeadCreate(company_name="Acme"), request, db, first_user)
-            other = main.create_lead(LeadCreate(company_name="Acme"), request, db, second_user)
+            first = main.create_lead(LeadCreate(company_name="Acme", contact_numbers=["9876543210"]), request, db, first_user)
+            replay = main.create_lead(LeadCreate(company_name="Acme", contact_numbers=["9876543210"]), request, db, first_user)
+            other = main.create_lead(LeadCreate(company_name="Acme", contact_numbers=["9876543210"]), request, db, second_user)
             self.assertEqual(first.id, replay.id)
             self.assertNotEqual(first.id, other.id)
             self.assertEqual(db.scalar(select(func.count()).select_from(LeadIdempotency)), 2)
@@ -50,7 +50,8 @@ class DocumentReviewFlowTests(unittest.TestCase):
             upload = UploadFile(filename='contacts.txt', file=stream)
             # This is an import-flow unit test, not a multi-gigabyte local
             # translation-model integration test.
-            with patch("backend.app.ocr.translate_document_text", return_value=(None, "unavailable")):
+            with patch("backend.app.ocr.translate_document_text", return_value=(None, "unavailable")), \
+                 patch("backend.app.translation.translate_document_text", return_value=(None, "unavailable")):
                 result = asyncio.run(main.preview_raw_leads(upload))
         fields = result['candidates'][0]['fields']
         self.assertEqual(fields['original_ocr_text'], source)
@@ -81,7 +82,7 @@ class DocumentReviewFlowTests(unittest.TestCase):
     def test_untranslated_ocr_cannot_be_saved_as_english(self) -> None:
         with self.session_factory() as db:
             with self.assertRaises(HTTPException) as error:
-                main.create_lead(LeadCreate(company_name="अनमोल", document_id="review-document", source_review_confirmed=True), db)
+                main.create_lead(LeadCreate(company_name="अनमोल", contact_numbers=["9876543210"], document_id="review-document", source_review_confirmed=True), db)
             self.assertEqual(error.exception.status_code, 422)
             self.assertEqual(db.scalar(select(func.count()).select_from(Lead)), 0)
 
@@ -91,7 +92,7 @@ class DocumentReviewFlowTests(unittest.TestCase):
             doc = db.get(Document, "review-document")
             doc.extracted_fields = {"original_ocr_text": "अनमोल", "raw_text": "Anmol"}
             db.commit()
-            saved = main.create_lead(LeadCreate(company_name="Anmol", raw_text="Anmol", document_id=doc.id, source_review_confirmed=True), db)
+            saved = main.create_lead(LeadCreate(company_name="Anmol", contact_numbers=["9876543210"], raw_text="Anmol", document_id=doc.id, source_review_confirmed=True), db)
             self.assertEqual(saved.original_ocr_text, "अनमोल")
             self.assertEqual(saved.company_name, "Anmol")
             with self.assertRaises(HTTPException):
@@ -111,6 +112,7 @@ class DocumentReviewFlowTests(unittest.TestCase):
         with self.session_factory() as db:
             lead = main.create_lead(LeadCreate(
                 company_name="SM Electricals",
+                contact_numbers=["9876543210"],
                 business_description="Lighting installation and maintenance",
                 raw_text="Company Name: SM Electricals\nDescription: Lighting installation and maintenance",
                 source_review_confirmed=True,
@@ -135,6 +137,7 @@ class DocumentReviewFlowTests(unittest.TestCase):
             saved = main.create_lead(
                 LeadCreate(
                     company_name="Anmol Boutique",
+                    contact_numbers=["9876543210"],
                     owner_name="Anmol Verma",
                     designation="Owner",
                     raw_text="अनमोल बुटीक\nसभी प्रकार के कपड़े",
@@ -226,7 +229,7 @@ class DocumentReviewFlowTests(unittest.TestCase):
 
     def test_user_confirmation_is_required_before_ocr_draft_is_saved(self) -> None:
         with self.session_factory() as db:
-            draft = LeadCreate(company_name="Acme Solutions Pvt Ltd", document_id="review-document")
+            draft = LeadCreate(company_name="Acme Solutions Pvt Ltd", contact_numbers=["1111111111"], document_id="review-document")
             with self.assertRaises(HTTPException) as error:
                 main.create_lead(draft, db)
             self.assertEqual(error.exception.status_code, 422)
@@ -254,7 +257,7 @@ class DocumentReviewFlowTests(unittest.TestCase):
 
     def test_editing_lead_persists_multiple_contacts_and_emails(self) -> None:
         with self.session_factory() as db:
-            saved = main.create_lead(LeadCreate(company_name="Acme Pvt Ltd"), db)
+            saved = main.create_lead(LeadCreate(company_name="Acme Pvt Ltd", contact_numbers=["+91 98765 00000"]), db)
             updated = main.update_lead(saved.id, main.LeadUpdate(
                 contact_numbers=["+91 98765 43210", "+91 98765 43211"],
                 email_addresses=["info@acme.example", "sales@acme.example"],
@@ -282,6 +285,7 @@ class DocumentReviewFlowTests(unittest.TestCase):
             db.commit()
             saved = main.create_lead(LeadCreate(
                 company_name="Acme Solutions Pvt Ltd",
+                contact_numbers=["9876543210"],
                 document_id="review-document",
                 source_document_ids=["review-document", "back-document"],
                 source_sides=["front", "back"],
@@ -478,9 +482,11 @@ class DocumentReviewFlowTests(unittest.TestCase):
         with self.session_factory() as db:
             main.create_lead(LeadCreate(
                 company_name="Acme Pvt Ltd", owner_name="Jane Doe", company_address="Navi Mumbai, Maharashtra",
+                contact_numbers=["9876543201"],
             ), db)
             main.create_lead(LeadCreate(
                 company_name="Acme Pvt Ltd", owner_name="John Doe", company_address="Pune, Maharashtra",
+                contact_numbers=["9876543202"],
             ), db)
             statement = main._filter_lead_statement(
                 select(Lead), company_name="Acme", owner_name="Jane", city="Mumbai", state="Maharashtra",
@@ -506,6 +512,217 @@ class DocumentReviewFlowTests(unittest.TestCase):
                 self.assertEqual([document.original_filename for document in documents], ["first.png", "second.jpg"])
                 self.assertTrue(all(Path(document.storage_path).is_file() for document in documents))
                 db.rollback()
+
+    def test_duplicate_phone_or_email_blocks_save(self) -> None:
+        with self.session_factory() as db:
+            first = main.create_lead(LeadCreate(
+                company_name="First Corp",
+                contact_numbers=["+91 9876543210"],
+                email_addresses=["info@first.example"],
+            ), db)
+            self.assertIsNotNone(first.id)
+
+            # Same phone (unprefixed) should be blocked with 409
+            with self.assertRaises(HTTPException) as ctx:
+                main.create_lead(LeadCreate(
+                    company_name="Second Corp",
+                    contact_numbers=["9876543210"],
+                ), db)
+            self.assertEqual(ctx.exception.status_code, 409)
+            self.assertIn("Duplicate lead detected", ctx.exception.detail)
+
+            # Same email (different case) should be blocked with 409
+            with self.assertRaises(HTTPException) as ctx:
+                main.create_lead(LeadCreate(
+                    company_name="Third Corp",
+                    contact_numbers=["9333333333"],
+                    email_addresses=["INFO@FIRST.EXAMPLE"],
+                ), db)
+            self.assertEqual(ctx.exception.status_code, 409)
+            self.assertIn("Duplicate lead detected", ctx.exception.detail)
+
+            # Check duplicate endpoint
+            check_req = main.DuplicateCheckRequest(contact_numbers=["9876543210"])
+            check_res = main.check_duplicate_lead(check_req, db, user=None)
+            self.assertTrue(check_res.is_duplicate)
+            self.assertEqual(check_res.existing_company_name, "First Corp")
+
+            # Check duplicate endpoint with exclude_lead_id
+            check_res_excluded = main.check_duplicate_lead(
+                main.DuplicateCheckRequest(contact_numbers=["9876543210"], exclude_lead_id=first.id),
+                db, user=None,
+            )
+            self.assertFalse(check_res_excluded.is_duplicate)
+
+    def test_batch_import_skips_duplicates(self) -> None:
+        with self.session_factory() as db:
+            main.create_lead(LeadCreate(
+                company_name="Existing Corp",
+                contact_numbers=["9876543210"],
+            ), db)
+
+            payload = [
+                main.LeadFields(company_name="Row 1", contact_numbers=["9876543210"]),
+                main.LeadFields(company_name="Row 2", contact_numbers=["9111111111"]),
+                main.LeadFields(company_name="Row 3", contact_numbers=["9111111111"]),
+                main.LeadFields(company_name="Row 4", contact_numbers=["9222222222"]),
+            ]
+            res = main.create_leads_batch(payload, db)
+            self.assertEqual(res["created"], 2)
+            self.assertEqual(res["skipped_duplicates"], 2)
+
+    def test_export_leads_custom_file_name_and_sanitization(self) -> None:
+        with self.session_factory() as db:
+            lead = main.create_lead(LeadCreate(
+                company_name="Test Company",
+                contact_numbers=["9876543210"],
+            ), db)
+
+            class CapturedResponse:
+                def __init__(self, content, headers=None, **_kwargs):
+                    self.content = content.getvalue()
+                    self.headers = headers or {}
+
+            # 1. Default filename when omitted
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res1 = main.export_leads(ids=[lead.id], db=db)
+            self.assertEqual(res1.headers.get("Content-Disposition"), 'attachment; filename="leads.xlsx"')
+
+            # 2. Custom human-readable filename
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res2 = main.export_leads(ids=[lead.id], filename="October leads", db=db)
+            self.assertEqual(res2.headers.get("Content-Disposition"), 'attachment; filename="October leads.xlsx"')
+
+            # 3. Path traversal attempt sanitized
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res3 = main.export_leads(ids=[lead.id], filename="../../secret-report", db=db)
+            self.assertEqual(res3.headers.get("Content-Disposition"), 'attachment; filename="secret-report.xlsx"')
+
+            # 4. Invalid characters sanitized
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res4 = main.export_leads(ids=[lead.id], filename='leads:2026*final?"test<file>|', db=db)
+            self.assertEqual(res4.headers.get("Content-Disposition"), 'attachment; filename="leads2026finaltestfile.xlsx"')
+
+            # 5. Duplicate .xlsx extension avoided
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res5 = main.export_leads(ids=[lead.id], filename="my-report.xlsx.xlsx", db=db)
+            self.assertEqual(res5.headers.get("Content-Disposition"), 'attachment; filename="my-report.xlsx"')
+
+            # 6. Very long name capped at 120 characters
+            long_name = "X" * 200
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res6 = main.export_leads(ids=[lead.id], filename=long_name, db=db)
+            expected_header = f'attachment; filename="{"X" * 120}.xlsx"'
+            self.assertEqual(res6.headers.get("Content-Disposition"), expected_header)
+
+            # 7. Exactly one 'Contact Numbers' column in exported workbook
+            workbook = load_workbook(BytesIO(res2.content))
+            sheet = workbook["Leads"]
+            headers = [cell.value for cell in sheet[1]]
+            self.assertEqual(headers.count("Contact Numbers"), 1)
+            self.assertEqual(headers.count("Contact Number 1"), 0)
+
+    def test_export_leads_selected_rows_and_filters(self) -> None:
+        with self.session_factory() as db:
+            l1 = main.create_lead(LeadCreate(company_name="Alpha", owner_name="Alice", company_address="Pune, Maharashtra", contact_numbers=["9876543201"]), db)
+            l2 = main.create_lead(LeadCreate(company_name="Beta", owner_name="Bob", company_address="Mumbai, Maharashtra", contact_numbers=["9876543202"]), db)
+            l3 = main.create_lead(LeadCreate(company_name="Gamma", owner_name="Charlie", company_address="Delhi", contact_numbers=["9876543203"]), db)
+
+            class CapturedResponse:
+                def __init__(self, content, headers=None, **_kwargs):
+                    self.content = content.getvalue()
+                    self.headers = headers or {}
+
+            # Selected IDs take precedence
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res = main.export_leads(ids=[l1.id, l3.id], city="Mumbai", db=db)
+            wb = load_workbook(BytesIO(res.content))
+            companies = [row[2] for row in wb["Leads"].iter_rows(min_row=2, values_only=True)]
+            self.assertEqual(set(companies), {"Alpha", "Gamma"})
+
+            # Filters work when no selection
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res_filtered = main.export_leads(ids=[], state="Maharashtra", db=db)
+            wb_filt = load_workbook(BytesIO(res_filtered.content))
+            companies_filt = [row[2] for row in wb_filt["Leads"].iter_rows(min_row=2, values_only=True)]
+            self.assertEqual(set(companies_filt), {"Alpha", "Beta"})
+
+    def test_incomplete_lead_validation_rules(self) -> None:
+        with self.session_factory() as db:
+            initial_count = db.scalar(select(func.count()).select_from(Lead))
+
+            # 1. Missing company name raises 422
+            with self.assertRaises(HTTPException) as ctx:
+                main.create_lead(LeadCreate(company_name="", contact_numbers=["9876543210"]), db)
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(ctx.exception.detail, "Company name and at least one contact number are required.")
+
+            # 2. Whitespace-only company name raises 422
+            with self.assertRaises(HTTPException) as ctx:
+                main.create_lead(LeadCreate(company_name="   \t\n  ", contact_numbers=["9876543210"]), db)
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(ctx.exception.detail, "Company name and at least one contact number are required.")
+
+            # 3. Missing contact number array raises 422
+            with self.assertRaises(HTTPException) as ctx:
+                main.create_lead(LeadCreate(company_name="Valid Company", contact_numbers=[]), db)
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(ctx.exception.detail, "Company name and at least one contact number are required.")
+
+            # 4. Blank contact-number array raises 422
+            with self.assertRaises(HTTPException) as ctx:
+                main.create_lead(LeadCreate(company_name="Valid Company", contact_numbers=["", "   ", " \t "]), db)
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(ctx.exception.detail, "Company name and at least one contact number are required.")
+
+            # Ensure no partial lead was created on failed validations
+            self.assertEqual(db.scalar(select(func.count()).select_from(Lead)), initial_count)
+
+            # 5. Duplicate contact numbers are deduplicated before check and saved
+            lead_dedup = main.create_lead(LeadCreate(
+                company_name="Dedup Enterprise",
+                contact_numbers=["9876543210", "+91 98765 43210", "9876543210"],
+            ), db)
+            self.assertIsNotNone(lead_dedup.id)
+            self.assertEqual(len(lead_dedup.contact_numbers), 1)
+            self.assertEqual(lead_dedup.contact_numbers[0], "+91 9876543210")
+
+            # 6. Valid company plus one contact number saves successfully with idempotency
+            request = Request({"type": "http", "method": "POST", "path": "/api/leads", "headers": [(b"x-idempotency-key", b"test-key-incomplete-123")]})
+            first_user = User(full_name="Valid User", email="user1@example.com", normalized_email="user1@example.com", password_hash="x")
+            db.add(first_user)
+            db.commit()
+            db.refresh(first_user)
+            saved1 = main.create_lead(
+                LeadCreate(company_name="Valid Tech", contact_numbers=["9811122233"]),
+                request, db, first_user
+            )
+            saved_replay = main.create_lead(
+                LeadCreate(company_name="Valid Tech", contact_numbers=["9811122233"]),
+                request, db, first_user
+            )
+            self.assertEqual(saved1.id, saved_replay.id)
+
+            # 7. Existing leads already stored without contact numbers remain readable and exportable
+            legacy_lead = Lead(id="legacy-lead-1", company_name="Legacy Preexisting Company")
+            db.add(legacy_lead)
+            db.commit()
+
+            listed = main.list_leads(page=1, page_size=50, db=db)["leads"]
+            found_legacy = next((item for item in listed if item.id == "legacy-lead-1"), None)
+            self.assertIsNotNone(found_legacy)
+            self.assertEqual(found_legacy.company_name, "Legacy Preexisting Company")
+
+            class CapturedResponse:
+                def __init__(self, content, headers=None, **_kwargs):
+                    self.content = content.getvalue()
+                    self.headers = headers or {}
+
+            with patch.object(main, "StreamingResponse", CapturedResponse):
+                res_legacy = main.export_leads(ids=["legacy-lead-1"], db=db)
+            wb_legacy = load_workbook(BytesIO(res_legacy.content))
+            sheet_legacy = wb_legacy["Leads"]
+            self.assertEqual(sheet_legacy["C2"].value, "Legacy Preexisting Company")
 
 if __name__ == "__main__":
     unittest.main()
